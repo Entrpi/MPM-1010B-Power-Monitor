@@ -6,103 +6,416 @@
 """
 MPM-1010B AC Power Meter Monitor
 
-Polls the meter and outputs a line when voltage or power changes significantly.
-Supports live terminal graph mode and file logging.
+Polls the meter and outputs readings via pluggable display backends.
+Supports terminal graphs, text output, and file logging.
 """
+
+from __future__ import annotations
 
 import argparse
 import sys
 import time
+from abc import ABC, abstractmethod
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import IO, NamedTuple
+from typing import IO, Protocol, Self, Sequence
 
 import serial
 
 
-class Reading(NamedTuple):
+# =============================================================================
+# Data Model
+# =============================================================================
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    """A single power meter reading."""
     voltage: float
     current: float
     power: float
     power_factor: float
     frequency: float
 
-
-class LogAccumulator:
-    """Accumulates readings and writes averaged values at fixed intervals."""
-
-    def __init__(self, file: IO[str], period: float, minmax: bool = False):
-        self.file = file
-        self.period = period
-        self.minmax = minmax
-        self.readings: list[Reading] = []
-        self.last_write = 0.0
-
-    def add(self, elapsed: float, reading: Reading) -> None:
-        self.readings.append(reading)
-        if elapsed - self.last_write >= self.period and self.readings:
-            self._flush(elapsed)
-
-    def _flush(self, elapsed: float) -> None:
-        n = len(self.readings)
-        avg = Reading(
-            sum(r.voltage for r in self.readings) / n,
-            sum(r.current for r in self.readings) / n,
-            sum(r.power for r in self.readings) / n,
-            sum(r.power_factor for r in self.readings) / n,
-            sum(r.frequency for r in self.readings) / n,
+    @classmethod
+    def average(cls, readings: Sequence[Self]) -> Self:
+        """Compute the average of multiple readings."""
+        n = len(readings)
+        return cls(
+            voltage=sum(r.voltage for r in readings) / n,
+            current=sum(r.current for r in readings) / n,
+            power=sum(r.power for r in readings) / n,
+            power_factor=sum(r.power_factor for r in readings) / n,
+            frequency=sum(r.frequency for r in readings) / n,
         )
-        if self.minmax:
-            min_r = Reading(
-                min(r.voltage for r in self.readings),
-                min(r.current for r in self.readings),
-                min(r.power for r in self.readings),
-                min(r.power_factor for r in self.readings),
-                min(r.frequency for r in self.readings),
-            )
-            max_r = Reading(
-                max(r.voltage for r in self.readings),
-                max(r.current for r in self.readings),
-                max(r.power for r in self.readings),
-                max(r.power_factor for r in self.readings),
-                max(r.frequency for r in self.readings),
-            )
-            write_log_line_minmax(self.file, elapsed, avg, min_r, max_r)
-        else:
-            write_log_line(self.file, elapsed, avg)
-        self.readings.clear()
-        self.last_write = elapsed
+
+    @classmethod
+    def min(cls, readings: Sequence[Self]) -> Self:
+        """Compute the element-wise minimum of multiple readings."""
+        return cls(
+            voltage=min(r.voltage for r in readings),
+            current=min(r.current for r in readings),
+            power=min(r.power for r in readings),
+            power_factor=min(r.power_factor for r in readings),
+            frequency=min(r.frequency for r in readings),
+        )
+
+    @classmethod
+    def max(cls, readings: Sequence[Self]) -> Self:
+        """Compute the element-wise maximum of multiple readings."""
+        return cls(
+            voltage=max(r.voltage for r in readings),
+            current=max(r.current for r in readings),
+            power=max(r.power for r in readings),
+            power_factor=max(r.power_factor for r in readings),
+            frequency=max(r.frequency for r in readings),
+        )
 
 
-def decode_4digits(b4: bytes, /) -> float:
+@dataclass
+class TimeSeries:
+    """Fixed-size time series buffer with timestamps."""
+    max_samples: int
+    timestamps: deque[float] = field(default_factory=deque)
+    readings: deque[Reading] = field(default_factory=deque)
+
+    def __post_init__(self):
+        self.timestamps = deque(maxlen=self.max_samples)
+        self.readings = deque(maxlen=self.max_samples)
+
+    def append(self, timestamp: float, reading: Reading) -> None:
+        self.timestamps.append(timestamp)
+        self.readings.append(reading)
+
+    def __len__(self) -> int:
+        return len(self.timestamps)
+
+
+@dataclass
+class DualResolutionBuffer:
+    """Maintains both high-resolution recent data and averaged history."""
+    recent: TimeSeries
+    history: TimeSeries
+    avg_period: float
+    _accumulator: list[Reading] = field(default_factory=list)
+    _last_avg_time: float = 0.0
+
+    def append(self, timestamp: float, reading: Reading) -> None:
+        """Add a reading, automatically averaging into history."""
+        self.recent.append(timestamp, reading)
+        self._accumulator.append(reading)
+
+        if timestamp - self._last_avg_time >= self.avg_period and self._accumulator:
+            avg = Reading.average(self._accumulator)
+            self.history.append(timestamp, avg)
+            self._accumulator.clear()
+            self._last_avg_time = timestamp
+
+
+# =============================================================================
+# Meter Communication
+# =============================================================================
+
+def decode_bcd_field(data: bytes, /) -> float:
     """Decode 4-byte BCD field with decimal point flag in high nibble."""
-    digits = [x & 0x0F for x in b4]
-    n = digits[0] * 1000 + digits[1] * 100 + digits[2] * 10 + digits[3]
-    for i, x in enumerate(b4):
-        if x & 0xF0:
-            return n / 10 ** (3 - i)
-    return float(n)
+    digits = [x & 0x0F for x in data]
+    value = digits[0] * 1000 + digits[1] * 100 + digits[2] * 10 + digits[3]
+    for i, byte in enumerate(data):
+        if byte & 0xF0:
+            return value / 10 ** (3 - i)
+    return float(value)
 
 
-def poll_meter(ser: serial.Serial, /) -> Reading | None:
-    """Poll meter and return Reading or None on error."""
-    ser.reset_input_buffer()
-    ser.write(b'?')
-    frame = ser.read(21)
+class MeterReader:
+    """Handles serial communication with the MPM-1010B meter."""
 
-    if len(frame) != 21 or frame[0] != 0x21:
-        return None
+    BAUD_RATE = 9600
+    FRAME_SIZE = 21
+    START_BYTE = 0x21
+    POLL_COMMAND = b'?'
 
-    return Reading(
-        decode_4digits(frame[1:5]),
-        decode_4digits(frame[5:9]),
-        decode_4digits(frame[9:13]),
-        decode_4digits(frame[13:17]),
-        decode_4digits(frame[17:21]),
+    def __init__(self, port: str, timeout: float = 0.1):
+        self.port = port
+        self.timeout = timeout
+        self._serial: serial.Serial | None = None
+
+    def open(self) -> None:
+        self._serial = serial.Serial(
+            self.port,
+            baudrate=self.BAUD_RATE,
+            bytesize=8,
+            parity='N',
+            stopbits=1,
+            timeout=self.timeout,
+        )
+
+    def close(self) -> None:
+        if self._serial:
+            self._serial.close()
+            self._serial = None
+
+    def __enter__(self) -> Self:
+        self.open()
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
+
+    def poll(self) -> Reading | None:
+        """Poll the meter and return a Reading, or None on error."""
+        if not self._serial:
+            raise RuntimeError("MeterReader not open")
+
+        self._serial.reset_input_buffer()
+        self._serial.write(self.POLL_COMMAND)
+        frame = self._serial.read(self.FRAME_SIZE)
+
+        if len(frame) != self.FRAME_SIZE or frame[0] != self.START_BYTE:
+            return None
+
+        return Reading(
+            voltage=decode_bcd_field(frame[1:5]),
+            current=decode_bcd_field(frame[5:9]),
+            power=decode_bcd_field(frame[9:13]),
+            power_factor=decode_bcd_field(frame[13:17]),
+            frequency=decode_bcd_field(frame[17:21]),
+        )
+
+
+# =============================================================================
+# Display Protocol & Implementations
+# =============================================================================
+
+class Display(Protocol):
+    """Protocol for display backends."""
+
+    def update(self, timestamp: float, reading: Reading, buffer: DualResolutionBuffer) -> None:
+        """Update the display with new data."""
+        ...
+
+    def close(self) -> None:
+        """Clean up display resources."""
+        ...
+
+
+@dataclass
+class TerminalGraphDisplay:
+    """Plotext-based terminal graph display."""
+    scale_v: tuple[float, float] | None = None
+    scale_w: tuple[float, float] | None = None
+    history_time: float = 600.0
+    avg_period: float = 1.0
+
+    def update(self, timestamp: float, reading: Reading, buffer: DualResolutionBuffer) -> None:
+        import plotext as plt
+
+        plt.clear_figure()
+        plt.subplots(2, 2)
+
+        recent_t = list(buffer.recent.timestamps)
+        recent_v = [r.voltage for r in buffer.recent.readings]
+        recent_w = [r.power for r in buffer.recent.readings]
+
+        history_t = list(buffer.history.timestamps)
+        history_v = [r.voltage for r in buffer.history.readings]
+        history_w = [r.power for r in buffer.history.readings]
+
+        # Voltage history (top-left)
+        plt.subplot(1, 1)
+        if history_t:
+            plt.plot(history_t, history_v, marker='braille', color='cyan')
+        plt.title(f'History ({self.history_time:.0f}s @ {self.avg_period:.1f}s avg)')
+        plt.ylabel('V')
+        if self.scale_v:
+            plt.ylim(*self.scale_v)
+
+        # Voltage recent (top-right)
+        plt.subplot(1, 2)
+        if recent_t:
+            plt.plot(recent_t, recent_v, marker='braille', color='cyan')
+        plt.title(f'Voltage: {reading.voltage:.1f} V')
+        if self.scale_v:
+            plt.ylim(*self.scale_v)
+
+        # Power history (bottom-left)
+        plt.subplot(2, 1)
+        if history_t:
+            plt.plot(history_t, history_w, marker='braille', color='yellow')
+        plt.ylabel('W')
+        plt.xlabel('Time (s)')
+        if self.scale_w:
+            plt.ylim(*self.scale_w)
+
+        # Power recent (bottom-right)
+        plt.subplot(2, 2)
+        if recent_t:
+            plt.plot(recent_t, recent_w, marker='braille', color='yellow')
+        plt.title(f'Power: {reading.power:.1f} W  (I={reading.current:.3f}A  PF={reading.power_factor:.2f}  {reading.frequency:.1f}Hz)')
+        plt.xlabel('Time (s)')
+        if self.scale_w:
+            plt.ylim(*self.scale_w)
+
+        plt.show()
+
+    def close(self) -> None:
+        pass
+
+
+@dataclass
+class TextDisplay:
+    """Simple text output to stdout."""
+    volts_threshold: float = 0.5
+    watts_threshold: float = 1.0
+    show_all: bool = False
+    _last: Reading | None = field(default=None, repr=False)
+    _header_printed: bool = field(default=False, repr=False)
+
+    def update(self, timestamp: float, reading: Reading, buffer: DualResolutionBuffer) -> None:
+        if not self._header_printed:
+            print("# timestamp\tV\tA\tW\tPF\tHz")
+            sys.stdout.flush()
+            self._header_printed = True
+
+        changed = (
+            self.show_all
+            or self._last is None
+            or abs(reading.voltage - self._last.voltage) >= self.volts_threshold
+            or abs(reading.power - self._last.power) >= self.watts_threshold
+        )
+
+        if changed:
+            ts = time.strftime('%H:%M:%S')
+            print(f"{ts}\t{reading.voltage:.2f}\t{reading.current:.3f}\t{reading.power:.2f}\t{reading.power_factor:.3f}\t{reading.frequency:.2f}")
+            sys.stdout.flush()
+            self._last = reading
+
+    def close(self) -> None:
+        pass
+
+
+# =============================================================================
+# File Logging
+# =============================================================================
+
+@dataclass
+class FileLogger:
+    """Logs readings to a TSV file with optional averaging and min/max."""
+    file: IO[str]
+    period: float
+    include_minmax: bool = False
+    _accumulator: list[Reading] = field(default_factory=list)
+    _last_write: float = 0.0
+
+    def write_header(self) -> None:
+        self.file.write("# MPM-1010B power log\n")
+        self.file.write(f"# started: {datetime.now().isoformat()}\n")
+        if self.include_minmax:
+            self.file.write("timestamp\telapsed_s\tV\tV_min\tV_max\tA\tA_min\tA_max\tW\tW_min\tW_max\tPF\tHz\n")
+        else:
+            self.file.write("timestamp\telapsed_s\tV\tA\tW\tPF\tHz\n")
+        self.file.flush()
+
+    def add(self, timestamp: float, reading: Reading) -> None:
+        self._accumulator.append(reading)
+        if timestamp - self._last_write >= self.period and self._accumulator:
+            self._flush(timestamp)
+
+    def _flush(self, timestamp: float) -> None:
+        avg = Reading.average(self._accumulator)
+        ts = datetime.now().isoformat(timespec='milliseconds')
+
+        if self.include_minmax:
+            min_r = Reading.min(self._accumulator)
+            max_r = Reading.max(self._accumulator)
+            self.file.write(
+                f"{ts}\t{timestamp:.2f}\t"
+                f"{avg.voltage:.2f}\t{min_r.voltage:.2f}\t{max_r.voltage:.2f}\t"
+                f"{avg.current:.3f}\t{min_r.current:.3f}\t{max_r.current:.3f}\t"
+                f"{avg.power:.2f}\t{min_r.power:.2f}\t{max_r.power:.2f}\t"
+                f"{avg.power_factor:.3f}\t{avg.frequency:.2f}\n"
+            )
+        else:
+            self.file.write(
+                f"{ts}\t{timestamp:.2f}\t"
+                f"{avg.voltage:.2f}\t{avg.current:.3f}\t{avg.power:.2f}\t"
+                f"{avg.power_factor:.3f}\t{avg.frequency:.2f}\n"
+            )
+        self.file.flush()
+        self._accumulator.clear()
+        self._last_write = timestamp
+
+    def close(self) -> None:
+        pass
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass
+class Config:
+    """Application configuration."""
+    device: str = '/dev/cu.PL2303G-USBtoUART3110'
+    period: float = 0.04  # 25 Hz
+
+    # Display mode
+    graph_mode: bool = False
+    chart_time: float = 60.0
+    history_time: float = 600.0
+    avg_period: float = 1.0
+    scale_v: tuple[float, float] | None = None
+    scale_w: tuple[float, float] | None = None
+
+    # Text mode
+    volts_threshold: float = 0.5
+    watts_threshold: float = 1.0
+    show_all: bool = False
+
+    # Logging
+    log_path: Path | None = None
+    log_period: float | None = None
+    log_minmax: bool = False
+
+    @property
+    def effective_log_period(self) -> float:
+        return self.log_period if self.log_period is not None else self.period
+
+
+# =============================================================================
+# Main Loop
+# =============================================================================
+
+def run(meter: MeterReader, config: Config, display: Display, logger: FileLogger | None) -> None:
+    """Main polling loop."""
+    buffer = DualResolutionBuffer(
+        recent=TimeSeries(max_samples=int(config.chart_time / config.period)),
+        history=TimeSeries(max_samples=int(config.history_time / config.avg_period)),
+        avg_period=config.avg_period,
     )
 
+    start_time = time.time()
+
+    while True:
+        reading = meter.poll()
+        if reading is None:
+            time.sleep(config.period)
+            continue
+
+        timestamp = time.time() - start_time
+        buffer.append(timestamp, reading)
+
+        if logger:
+            logger.add(timestamp, reading)
+
+        display.update(timestamp, reading, buffer)
+        time.sleep(config.period)
+
+
+# =============================================================================
+# CLI
+# =============================================================================
 
 def parse_range(s: str) -> tuple[float, float]:
     """Parse 'min:max' range string."""
@@ -110,164 +423,8 @@ def parse_range(s: str) -> tuple[float, float]:
     return float(lo), float(hi)
 
 
-def write_log_header(f: IO[str], minmax: bool = False) -> None:
-    """Write TSV header to log file."""
-    f.write("# MPM-1010B power log\n")
-    f.write("# started: " + datetime.now().isoformat() + "\n")
-    if minmax:
-        f.write("timestamp\telapsed_s\tV\tV_min\tV_max\tA\tA_min\tA_max\tW\tW_min\tW_max\tPF\tHz\n")
-    else:
-        f.write("timestamp\telapsed_s\tV\tA\tW\tPF\tHz\n")
-    f.flush()
-
-
-def write_log_line(f: IO[str], elapsed: float, r: Reading) -> None:
-    """Write a reading to log file."""
-    ts = datetime.now().isoformat(timespec='milliseconds')
-    f.write(f"{ts}\t{elapsed:.2f}\t{r.voltage:.2f}\t{r.current:.3f}\t{r.power:.2f}\t{r.power_factor:.3f}\t{r.frequency:.2f}\n")
-    f.flush()
-
-
-def write_log_line_minmax(f: IO[str], elapsed: float, avg: Reading, min_r: Reading, max_r: Reading) -> None:
-    """Write a reading with min/max to log file."""
-    ts = datetime.now().isoformat(timespec='milliseconds')
-    f.write(f"{ts}\t{elapsed:.2f}\t"
-            f"{avg.voltage:.2f}\t{min_r.voltage:.2f}\t{max_r.voltage:.2f}\t"
-            f"{avg.current:.3f}\t{min_r.current:.3f}\t{max_r.current:.3f}\t"
-            f"{avg.power:.2f}\t{min_r.power:.2f}\t{max_r.power:.2f}\t"
-            f"{avg.power_factor:.3f}\t{avg.frequency:.2f}\n")
-    f.flush()
-
-
-def run_graph_mode(ser: serial.Serial, args: argparse.Namespace, logger: LogAccumulator | None) -> None:
-    """Run live graph display with dual timescales."""
-    import plotext as plt
-
-    # Recent (detail) buffers - high resolution
-    max_recent = int(args.chart_time / args.period)
-    recent_t: deque[float] = deque(maxlen=max_recent)
-    recent_v: deque[float] = deque(maxlen=max_recent)
-    recent_w: deque[float] = deque(maxlen=max_recent)
-
-    # History (rolloff) buffers - averaged, longer timespan
-    max_history = int(args.history_time / args.avg_period)
-    history_t: deque[float] = deque(maxlen=max_history)
-    history_v: deque[float] = deque(maxlen=max_history)
-    history_w: deque[float] = deque(maxlen=max_history)
-
-    # Accumulator for averaging
-    acc_v: list[float] = []
-    acc_w: list[float] = []
-    last_avg_time = 0.0
-
-    start_time = time.time()
-
-    while True:
-        reading = poll_meter(ser)
-        if reading is None:
-            time.sleep(args.period)
-            continue
-
-        now = time.time() - start_time
-        recent_t.append(now)
-        recent_v.append(reading.voltage)
-        recent_w.append(reading.power)
-
-        if logger:
-            logger.add(now, reading)
-
-        # Accumulate for averaging
-        acc_v.append(reading.voltage)
-        acc_w.append(reading.power)
-
-        # Roll off averaged data to history
-        if now - last_avg_time >= args.avg_period and acc_v:
-            history_t.append(now)
-            history_v.append(sum(acc_v) / len(acc_v))
-            history_w.append(sum(acc_w) / len(acc_w))
-            acc_v.clear()
-            acc_w.clear()
-            last_avg_time = now
-
-        plt.clear_figure()
-
-        # 2 rows × 2 columns: [history_v, recent_v] / [history_w, recent_w]
-        plt.subplots(2, 2)
-
-        # Voltage history (top-left)
-        plt.subplot(1, 1)
-        if history_t:
-            plt.plot(list(history_t), list(history_v), marker='braille', color='cyan')
-        plt.title(f'History ({args.history_time:.0f}s @ {args.avg_period:.1f}s avg)')
-        plt.ylabel('V')
-        if args.scale_v:
-            plt.ylim(*args.scale_v)
-
-        # Voltage recent (top-right)
-        plt.subplot(1, 2)
-        plt.plot(list(recent_t), list(recent_v), marker='braille', color='cyan')
-        plt.title(f'Voltage: {reading.voltage:.1f} V')
-        if args.scale_v:
-            plt.ylim(*args.scale_v)
-
-        # Power history (bottom-left)
-        plt.subplot(2, 1)
-        if history_t:
-            plt.plot(list(history_t), list(history_w), marker='braille', color='yellow')
-        plt.ylabel('W')
-        plt.xlabel('Time (s)')
-        if args.scale_w:
-            plt.ylim(*args.scale_w)
-
-        # Power recent (bottom-right)
-        plt.subplot(2, 2)
-        plt.plot(list(recent_t), list(recent_w), marker='braille', color='yellow')
-        plt.title(f'Power: {reading.power:.1f} W  (I={reading.current:.3f}A  PF={reading.power_factor:.2f}  {reading.frequency:.1f}Hz)')
-        plt.xlabel('Time (s)')
-        if args.scale_w:
-            plt.ylim(*args.scale_w)
-
-        plt.show()
-        time.sleep(args.period)
-
-
-def run_text_mode(ser: serial.Serial, args: argparse.Namespace, logger: LogAccumulator | None) -> None:
-    """Run text output mode."""
-    last: Reading | None = None
-    start_time = time.time()
-
-    print(f"# Monitoring {args.device} (period={args.period}s, dV={args.volts}V, dP={args.watts}W)")
-    print("# timestamp\tV\tA\tW\tPF\tHz")
-    sys.stdout.flush()
-
-    while True:
-        if (reading := poll_meter(ser)) is None:
-            time.sleep(args.period)
-            continue
-
-        elapsed = time.time() - start_time
-
-        if logger:
-            logger.add(elapsed, reading)
-
-        changed = (
-            args.all
-            or last is None
-            or abs(reading.voltage - last.voltage) >= args.volts
-            or abs(reading.power - last.power) >= args.watts
-        )
-
-        if changed:
-            ts = time.strftime('%H:%M:%S')
-            r = reading
-            print(f"{ts}\t{r.voltage:.2f}\t{r.current:.3f}\t{r.power:.2f}\t{r.power_factor:.3f}\t{r.frequency:.2f}")
-            sys.stdout.flush()
-            last = reading
-
-        time.sleep(args.period)
-
-
-def main() -> None:
+def parse_args() -> Config:
+    """Parse command line arguments into Config."""
     parser = argparse.ArgumentParser(
         description='Monitor MPM-1010B power meter',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -289,7 +446,6 @@ def main() -> None:
     parser.add_argument('-M', '--log-minmax', action='store_true',
                         help='Include min/max columns in log (for V, A, W)')
 
-    # Text mode options
     text_group = parser.add_argument_group('text mode')
     text_group.add_argument('-w', '--watts', type=float, default=1.0,
                             help='Power change threshold in watts (default: 1.0)')
@@ -298,7 +454,6 @@ def main() -> None:
     text_group.add_argument('--all', action='store_true',
                             help='Output every reading (ignore thresholds)')
 
-    # Graph mode options
     graph_group = parser.add_argument_group('graph mode')
     graph_group.add_argument('-g', '--graph', action='store_true',
                              help='Enable live graph mode')
@@ -315,28 +470,64 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    return Config(
+        device=args.device,
+        period=args.period,
+        graph_mode=args.graph,
+        chart_time=args.chart_time,
+        history_time=args.history_time,
+        avg_period=args.avg_period,
+        scale_v=args.scale_v,
+        scale_w=args.scale_w,
+        volts_threshold=args.volts,
+        watts_threshold=args.watts,
+        show_all=args.all,
+        log_path=args.log,
+        log_period=args.log_period,
+        log_minmax=args.log_minmax,
+    )
+
+
+def main() -> None:
+    config = parse_args()
+
+    # Create display
+    if config.graph_mode:
+        display: Display = TerminalGraphDisplay(
+            scale_v=config.scale_v,
+            scale_w=config.scale_w,
+            history_time=config.history_time,
+            avg_period=config.avg_period,
+        )
+    else:
+        display = TextDisplay(
+            volts_threshold=config.volts_threshold,
+            watts_threshold=config.watts_threshold,
+            show_all=config.show_all,
+        )
+
     try:
-        log_ctx = open(args.log, 'w') if args.log else nullcontext()
-        with log_ctx as log_file, \
-             serial.Serial(args.device, baudrate=9600, bytesize=8,
-                           parity='N', stopbits=1, timeout=1.0) as ser:
+        log_ctx = open(config.log_path, 'w') if config.log_path else nullcontext()
+        with log_ctx as log_file, MeterReader(config.device) as meter:
             logger = None
             if log_file:
-                log_period = args.log_period if args.log_period else args.period
-                write_log_header(log_file, args.log_minmax)
-                logger = LogAccumulator(log_file, log_period, args.log_minmax)
-                minmax_str = ", minmax" if args.log_minmax else ""
-                print(f"# Logging to {args.log} (period={log_period}s{minmax_str})", file=sys.stderr)
+                logger = FileLogger(
+                    file=log_file,
+                    period=config.effective_log_period,
+                    include_minmax=config.log_minmax,
+                )
+                logger.write_header()
+                minmax_str = ", minmax" if config.log_minmax else ""
+                print(f"# Logging to {config.log_path} (period={config.effective_log_period}s{minmax_str})", file=sys.stderr)
 
-            if args.graph:
-                run_graph_mode(ser, args, logger)
-            else:
-                run_text_mode(ser, args, logger)
+            run(meter, config, display, logger)
 
     except KeyboardInterrupt:
         print("\n# Stopped", file=sys.stderr)
     except serial.SerialException as e:
         sys.exit(f"Serial error: {e}")
+    finally:
+        display.close()
 
 
 if __name__ == '__main__':
