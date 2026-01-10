@@ -1,7 +1,7 @@
-#!/usr/bin/env -S uv run --with pyserial,plotext,dearpygui python3
+#!/usr/bin/env -S uv run --with pyserial,plotext,dearpygui,influxdb-client python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pyserial", "plotext", "dearpygui"]
+# dependencies = ["pyserial", "plotext", "dearpygui", "influxdb-client"]
 # ///
 """
 MPM-1010B AC Power Meter Monitor
@@ -893,6 +893,48 @@ class BinaryLogger:
         return start_time
 
 
+@dataclass
+class InfluxDBLogger:
+    """Streams readings to InfluxDB 2.x."""
+    url: str
+    token: str
+    org: str
+    bucket: str
+    measurement: str = "power_meter"
+    _client: object = field(default=None, repr=False)
+    _write_api: object = field(default=None, repr=False)
+
+    def open(self) -> None:
+        """Initialize InfluxDB client."""
+        from influxdb_client import InfluxDBClient
+        from influxdb_client.client.write_api import SYNCHRONOUS
+
+        self._client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
+        self._write_api = self._client.write_api(write_options=SYNCHRONOUS)
+
+    def add(self, timestamp: float, reading: Reading) -> None:
+        """Write reading to InfluxDB."""
+        from influxdb_client import Point
+
+        point = (
+            Point(self.measurement)
+            .field("voltage", reading.voltage)
+            .field("current", reading.current)
+            .field("power", reading.power)
+            .field("power_factor", reading.power_factor)
+            .field("frequency", reading.frequency)
+            .time(int(time.time() * 1_000_000_000))  # nanoseconds
+        )
+        self._write_api.write(bucket=self.bucket, record=point)
+
+    def close(self) -> None:
+        """Close InfluxDB client."""
+        if self._write_api:
+            self._write_api.close()
+        if self._client:
+            self._client.close()
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -925,6 +967,12 @@ class Config:
 
     # Binary persistence
     db_path: Path | None = None
+
+    # InfluxDB
+    influx_url: str | None = None
+    influx_token: str | None = None
+    influx_org: str | None = None
+    influx_bucket: str | None = None
 
     # Port control
     force: bool = False
@@ -1018,6 +1066,16 @@ def parse_args() -> Config:
     parser.add_argument('--db', type=Path, nargs='?', const=Path(__file__).parent / 'data',
                         metavar='PATH', help='Binary database directory (default: ./data when enabled)')
 
+    influx_group = parser.add_argument_group('InfluxDB')
+    influx_group.add_argument('--influx-url', metavar='URL',
+                              help='InfluxDB server URL (e.g., http://localhost:8086)')
+    influx_group.add_argument('--influx-token', metavar='TOKEN',
+                              help='InfluxDB API token')
+    influx_group.add_argument('--influx-org', metavar='ORG',
+                              help='InfluxDB organization')
+    influx_group.add_argument('--influx-bucket', metavar='BUCKET',
+                              help='InfluxDB bucket name')
+
     text_group = parser.add_argument_group('text mode')
     text_group.add_argument('-w', '--watts', type=float, default=1.0,
                             help='Power change threshold in watts (default: 1.0)')
@@ -1083,6 +1141,10 @@ def parse_args() -> Config:
         log_period=args.log_period,
         log_minmax=args.log_minmax,
         db_path=args.db,
+        influx_url=args.influx_url,
+        influx_token=args.influx_token,
+        influx_org=args.influx_org,
+        influx_bucket=args.influx_bucket,
         force=args.force,
     )
 
@@ -1141,6 +1203,18 @@ def main() -> None:
             binary_logger.open()
             sinks.append(binary_logger)
             print(f"# Binary logging to {config.db_path}/", file=sys.stderr)
+
+        # Set up InfluxDB streaming if configured
+        if config.influx_url and config.influx_token and config.influx_org and config.influx_bucket:
+            influx_logger = InfluxDBLogger(
+                url=config.influx_url,
+                token=config.influx_token,
+                org=config.influx_org,
+                bucket=config.influx_bucket,
+            )
+            influx_logger.open()
+            sinks.append(influx_logger)
+            print(f"# Streaming to InfluxDB at {config.influx_url}", file=sys.stderr)
 
         # Set start_time for wallclock display (use current time if no history)
         if start_time is None:

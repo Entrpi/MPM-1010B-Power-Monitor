@@ -16,6 +16,7 @@ Real-time AC power monitoring for the Matrix MPM-1010B power meter with multi-ti
 - **Text output**: Tab-separated values for piping to other tools
 - **File logging**: TSV output with configurable averaging and optional min/max tracking
 - **Persistent history**: Binary storage with cascading aggregation, survives restarts
+- **InfluxDB streaming**: Real-time data export to InfluxDB 2.x for Grafana dashboards
 - **Force takeover**: Automatically kill other processes holding the serial port
 
 ## Requirements
@@ -44,9 +45,11 @@ The script uses `uv` for automatic dependency management. Dependencies (pyserial
 
 ```
 usage: mpm1010b-power-monitor.py [-h] [-d DEVICE] [-f] [-p PERIOD] [-l FILE]
-                                 [-L SEC] [-M] [--db [PATH]] [-w WATTS]
-                                 [-v VOLTS] [--all] [-g] [--gui] [-c {2-6}]
-                                 [-t CHART_TIME] [-T HISTORY_TIME]
+                                 [-L SEC] [-M] [--db [PATH]]
+                                 [--influx-url URL] [--influx-token TOKEN]
+                                 [--influx-org ORG] [--influx-bucket BUCKET]
+                                 [-w WATTS] [-v VOLTS] [--all] [-g] [--gui]
+                                 [-c {2-6}] [-t CHART_TIME] [-T HISTORY_TIME]
                                  [-a AVG_PERIOD] [--scale-v MIN:MAX]
                                  [--scale-w MIN:MAX] [-m METRICS]
 ```
@@ -138,6 +141,19 @@ Storage format:
 - Separate files per cascade level (`level_0_1s.bin`, `level_1_10s.bin`, etc.)
 - ~1.7 GB/year for all cascade levels with default settings
 
+### InfluxDB Options
+
+| Option | Description |
+|--------|-------------|
+| `--influx-url URL` | InfluxDB server URL (e.g., `http://localhost:8086`) |
+| `--influx-token TOKEN` | InfluxDB API token |
+| `--influx-org ORG` | InfluxDB organization |
+| `--influx-bucket BUCKET` | InfluxDB bucket name |
+
+Streams readings to InfluxDB 2.x in real-time. All four options are required to enable InfluxDB logging. Can be combined with GUI display and other sinks.
+
+Data is written as measurement `power_meter` with fields: `voltage`, `current`, `power`, `power_factor`, `frequency`.
+
 ## Examples
 
 ```bash
@@ -167,6 +183,13 @@ Storage format:
 
 # Custom database path
 ./mpm1010b-power-monitor.py --gui --db /path/to/data
+
+# Stream to InfluxDB with GUI
+./mpm1010b-power-monitor.py --gui \
+    --influx-url http://localhost:8086 \
+    --influx-token your-token \
+    --influx-org your-org \
+    --influx-bucket power
 ```
 
 ## Output Format
@@ -224,7 +247,7 @@ CascadingBuffer      - Multi-level time series with 10x averaging cascade
     |
     +---> Display    - Visualization (GUI, terminal graph, or text)
     |
-    +---> DataSink   - File logging (TSV) or binary persistence
+    +---> DataSink   - File logging (TSV), binary persistence, or InfluxDB
 ```
 
 The `CascadingBuffer` maintains multiple `TimeSeries` at different time resolutions:
