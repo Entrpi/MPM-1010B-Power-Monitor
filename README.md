@@ -1,8 +1,12 @@
 # MPM-1010B Power Monitor
 
+<img src="icon.png" width="128" align="right">
+
 Real-time AC power monitoring for the Matrix MPM-1010B power meter with multi-timescale visualization, native GUI, terminal graphs, and data logging.
 
 ![GUI Example](gui-example.png)
+
+![Full Example - 5 columns with all metrics](full-example.png)
 
 ## Features
 
