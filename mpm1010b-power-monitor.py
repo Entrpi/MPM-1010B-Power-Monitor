@@ -96,24 +96,51 @@ class TimeSeries:
 
 
 @dataclass
-class DualResolutionBuffer:
-    """Maintains both high-resolution recent data and averaged history."""
-    recent: TimeSeries
-    history: TimeSeries
-    avg_period: float
-    _accumulator: list[Reading] = field(default_factory=list)
-    _last_avg_time: float = 0.0
+class CascadingBuffer:
+    """Maintains multiple time-resolution levels with 10x cascading averages.
+
+    Level 0 is raw samples at poll rate.
+    Level 1 is averaged at base_period (e.g., 1s).
+    Level 2+ cascade at 10x intervals from base_period (10s, 100s, ...).
+    """
+    levels: list[TimeSeries]
+    base_period: float  # First averaging period (e.g., 1s)
+    _accumulators: list[list[Reading]] = field(default_factory=list)
+    _last_times: list[float] = field(default_factory=list)
+
+    def __post_init__(self):
+        self._accumulators = [[] for _ in range(len(self.levels) - 1)]
+        self._last_times = [0.0] * (len(self.levels) - 1)
+
+    def period_for_level(self, level: int) -> float:
+        """Get the averaging period for a given level (1+)."""
+        if level <= 0:
+            return 0.0
+        return self.base_period * (10 ** (level - 1))
 
     def append(self, timestamp: float, reading: Reading) -> None:
-        """Add a reading, automatically averaging into history."""
-        self.recent.append(timestamp, reading)
-        self._accumulator.append(reading)
+        """Add a reading, cascading averages through levels."""
+        self.levels[0].append(timestamp, reading)
 
-        if timestamp - self._last_avg_time >= self.avg_period and self._accumulator:
-            avg = Reading.average(self._accumulator)
-            self.history.append(timestamp, avg)
-            self._accumulator.clear()
-            self._last_avg_time = timestamp
+        for i in range(len(self.levels) - 1):
+            period = self.period_for_level(i + 1)
+            self._accumulators[i].append(reading)
+
+            if timestamp - self._last_times[i] >= period and self._accumulators[i]:
+                avg = Reading.average(self._accumulators[i])
+                self.levels[i + 1].append(timestamp, avg)
+                self._accumulators[i].clear()
+                self._last_times[i] = timestamp
+
+    @property
+    def recent(self) -> TimeSeries:
+        """Compatibility: return level 0."""
+        return self.levels[0]
+
+    @property
+    def history(self) -> TimeSeries:
+        """Compatibility: return highest level."""
+        return self.levels[-1] if len(self.levels) > 1 else self.levels[0]
 
 
 # =============================================================================
@@ -257,7 +284,7 @@ class DataSink(Protocol):
 class Display(Protocol):
     """Protocol for display backends (visualization)."""
 
-    def update(self, timestamp: float, reading: Reading, buffer: DualResolutionBuffer) -> None:
+    def update(self, timestamp: float, reading: Reading, buffer: CascadingBuffer) -> None:
         """Update the display with new data."""
         ...
 
@@ -269,59 +296,59 @@ class Display(Protocol):
 @dataclass
 class TerminalGraphDisplay:
     """Plotext-based terminal graph display."""
+    num_columns: int = 2
+    poll_period: float = 0.04
     scale_v: tuple[float, float] | None = None
     scale_w: tuple[float, float] | None = None
-    history_time: float = 600.0
     avg_period: float = 1.0
 
-    def update(self, timestamp: float, reading: Reading, buffer: DualResolutionBuffer) -> None:
+    def update(self, timestamp: float, reading: Reading, buffer: CascadingBuffer) -> None:
         import plotext as plt
 
+        n = min(self.num_columns, len(buffer.levels))
         plt.clear_figure()
-        plt.subplots(2, 2)
+        plt.subplots(2, n)
 
-        recent_t = list(buffer.recent.timestamps)
-        recent_v = [r.voltage for r in buffer.recent.readings]
-        recent_w = [r.power for r in buffer.recent.readings]
+        # Display columns right-to-left: rightmost = recent, leftmost = longest avg
+        for col in range(n):
+            level_idx = n - 1 - col  # Reverse: col 0 gets highest level
+            level = buffer.levels[level_idx]
+            t = list(level.timestamps) if level.timestamps else []
+            v = [r.voltage for r in level.readings] if level.readings else []
+            w = [r.power for r in level.readings] if level.readings else []
 
-        history_t = list(buffer.history.timestamps)
-        history_v = [r.voltage for r in buffer.history.readings]
-        history_w = [r.power for r in buffer.history.readings]
+            # Column label
+            if level_idx == 0:
+                hz = 1.0 / self.poll_period
+                label = f"{hz:.0f}Hz"
+            else:
+                period = self.avg_period * (10 ** (level_idx - 1))
+                label = f"{period:.0f}s avg" if period >= 1 else f"{period*1000:.0f}ms avg"
 
-        # Voltage history (top-left)
-        plt.subplot(1, 1)
-        if history_t:
-            plt.plot(history_t, history_v, marker='braille', color='cyan')
-        plt.title(f'History ({self.history_time:.0f}s @ {self.avg_period:.1f}s avg)')
-        plt.ylabel('V')
-        if self.scale_v:
-            plt.ylim(*self.scale_v)
+            # Voltage (top row)
+            plt.subplot(1, col + 1)
+            if t:
+                plt.plot(t, v, marker='braille', color='cyan')
+            if level_idx == 0:
+                plt.title(f'V: {reading.voltage:.1f}V - {label}')
+            else:
+                plt.title(f'Voltage - {label}')
+            plt.ylabel('V')
+            if self.scale_v:
+                plt.ylim(*self.scale_v)
 
-        # Voltage recent (top-right)
-        plt.subplot(1, 2)
-        if recent_t:
-            plt.plot(recent_t, recent_v, marker='braille', color='cyan')
-        plt.title(f'Voltage: {reading.voltage:.1f} V')
-        if self.scale_v:
-            plt.ylim(*self.scale_v)
-
-        # Power history (bottom-left)
-        plt.subplot(2, 1)
-        if history_t:
-            plt.plot(history_t, history_w, marker='braille', color='yellow')
-        plt.ylabel('W')
-        plt.xlabel('Time (s)')
-        if self.scale_w:
-            plt.ylim(*self.scale_w)
-
-        # Power recent (bottom-right)
-        plt.subplot(2, 2)
-        if recent_t:
-            plt.plot(recent_t, recent_w, marker='braille', color='yellow')
-        plt.title(f'Power: {reading.power:.1f} W  (I={reading.current:.3f}A  PF={reading.power_factor:.2f}  {reading.frequency:.1f}Hz)')
-        plt.xlabel('Time (s)')
-        if self.scale_w:
-            plt.ylim(*self.scale_w)
+            # Power (bottom row)
+            plt.subplot(2, col + 1)
+            if t:
+                plt.plot(t, w, marker='braille', color='yellow')
+            if level_idx == 0:
+                plt.title(f'W: {reading.power:.1f}W  I={reading.current:.3f}A  PF={reading.power_factor:.2f}  {reading.frequency:.1f}Hz')
+            else:
+                plt.title(f'Power - {label}')
+            plt.ylabel('W')
+            plt.xlabel('Time (s)')
+            if self.scale_w:
+                plt.ylim(*self.scale_w)
 
         plt.show()
 
@@ -338,7 +365,7 @@ class TextDisplay:
     _last: Reading | None = field(default=None, repr=False)
     _header_printed: bool = field(default=False, repr=False)
 
-    def update(self, timestamp: float, reading: Reading, buffer: DualResolutionBuffer) -> None:
+    def update(self, timestamp: float, reading: Reading, buffer: CascadingBuffer) -> None:
         if not self._header_printed:
             print("# timestamp\tV\tA\tW\tPF\tHz")
             sys.stdout.flush()
@@ -364,12 +391,13 @@ class TextDisplay:
 @dataclass
 class DearPyGuiDisplay:
     """DearPyGui-based native GUI display with implot."""
+    num_columns: int = 2
+    poll_period: float = 0.04
     scale_v: tuple[float, float] | None = None
     scale_w: tuple[float, float] | None = None
-    history_time: float = 600.0
     avg_period: float = 1.0
     _initialized: bool = field(default=False, repr=False)
-    _split_ratio: float = field(default=0.5, repr=False)
+    _col_widths: list[float] = field(default_factory=list, repr=False)
 
     def _setup(self) -> None:
         """Initialize DearPyGui context and window."""
@@ -379,68 +407,92 @@ class DearPyGuiDisplay:
         dpg.create_viewport(title='MPM-1010B Power Monitor', width=1200, height=700)
 
         SPLITTER_WIDTH = 8
+        n = self.num_columns
+        # Initialize equal column widths
+        if not self._col_widths:
+            self._col_widths = [1.0 / n] * n
 
         def resize_plots():
             """Resize plots to fit viewport."""
             vp_height = dpg.get_viewport_height()
             vp_width = dpg.get_viewport_width()
             plot_height = (vp_height - 60) // 2
-            content_height = plot_height * 2 + 8  # Two plots plus spacing
-            usable_width = vp_width - SPLITTER_WIDTH - 16
-            left_width = int(usable_width * self._split_ratio)
-            right_width = usable_width - left_width
-            for tag in ("plot_v_hist", "plot_w_hist", "plot_v_recent", "plot_w_recent"):
-                dpg.set_item_height(tag, plot_height)
-            dpg.set_item_width("left_col", left_width)
-            dpg.set_item_width("right_col", right_width)
-            dpg.set_item_height("splitter", content_height)
+            content_height = plot_height * 2 + 8
+            num_splitters = n - 1
+            usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - 16
 
-        def on_splitter_drag(sender, app_data):
-            mouse_x = dpg.get_mouse_pos(local=False)[0]
-            vp_width = dpg.get_viewport_width()
-            usable_width = vp_width - SPLITTER_WIDTH - 16
-            self._split_ratio = max(0.2, min(0.8, (mouse_x - 8) / usable_width))
-            resize_plots()
+            for i in range(n):
+                col_width = int(usable_width * self._col_widths[i])
+                dpg.set_item_width(f"col_{i}", col_width)
+                dpg.set_item_height(f"plot_v_{i}", plot_height)
+                dpg.set_item_height(f"plot_w_{i}", plot_height)
+
+            for i in range(num_splitters):
+                dpg.set_item_height(f"splitter_{i}", content_height)
+
+        def make_splitter_drag(idx):
+            def on_drag(sender, app_data):
+                mouse_x = dpg.get_mouse_pos(local=False)[0]
+                vp_width = dpg.get_viewport_width()
+                num_splitters = n - 1
+                usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - 16
+
+                # Calculate cumulative position up to this splitter
+                cumulative = sum(self._col_widths[:idx]) * usable_width + 8
+                for i in range(idx):
+                    cumulative += SPLITTER_WIDTH
+
+                # New ratio for column idx
+                new_width = max(50, mouse_x - cumulative)
+                new_ratio = new_width / usable_width
+
+                # Adjust this column and take from the next
+                old_ratio = self._col_widths[idx]
+                delta = new_ratio - old_ratio
+                if self._col_widths[idx + 1] - delta > 0.1:
+                    self._col_widths[idx] = new_ratio
+                    self._col_widths[idx + 1] -= delta
+                resize_plots()
+            return on_drag
 
         with dpg.window(label="Power Monitor", tag="main_window", no_scrollbar=True):
             with dpg.group(horizontal=True):
-                # History plots (left)
-                with dpg.group(tag="left_col"):
-                    with dpg.plot(label="Voltage History", height=300, width=-1, tag="plot_v_hist"):
-                        dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="v_hist_x")
-                        dpg.add_plot_axis(dpg.mvYAxis, label="V", tag="v_hist_y")
-                        dpg.add_line_series([], [], label="V", parent="v_hist_y", tag="series_v_hist")
-                        if self.scale_v:
-                            dpg.set_axis_limits("v_hist_y", self.scale_v[0], self.scale_v[1])
+                # Display columns: leftmost = longest avg, rightmost = recent
+                for col in range(n):
+                    level_idx = n - 1 - col  # Reverse: col 0 gets highest level
 
-                    with dpg.plot(label="Power History", height=300, width=-1, tag="plot_w_hist"):
-                        dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="w_hist_x")
-                        dpg.add_plot_axis(dpg.mvYAxis, label="W", tag="w_hist_y")
-                        dpg.add_line_series([], [], label="W", parent="w_hist_y", tag="series_w_hist")
-                        if self.scale_w:
-                            dpg.set_axis_limits("w_hist_y", self.scale_w[0], self.scale_w[1])
+                    # Column label based on level
+                    if level_idx == 0:
+                        hz = 1.0 / self.poll_period
+                        label = f"{hz:.0f}Hz"
+                    else:
+                        period = self.avg_period * (10 ** (level_idx - 1))
+                        if period >= 1:
+                            label = f"{period:.0f}s avg"
+                        else:
+                            label = f"{period*1000:.0f}ms avg"
 
-                # Draggable splitter
-                dpg.add_button(label="", width=SPLITTER_WIDTH, height=300, tag="splitter")
-                with dpg.item_handler_registry(tag="splitter_handler"):
-                    dpg.add_item_active_handler(callback=on_splitter_drag)
-                dpg.bind_item_handler_registry("splitter", "splitter_handler")
+                    with dpg.group(tag=f"col_{col}"):
+                        with dpg.plot(label=f"Voltage - {label}", height=300, width=-1, tag=f"plot_v_{col}"):
+                            dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag=f"v_x_{col}")
+                            dpg.add_plot_axis(dpg.mvYAxis, label="V", tag=f"v_y_{col}")
+                            dpg.add_line_series([], [], label="V", parent=f"v_y_{col}", tag=f"series_v_{col}")
+                            if self.scale_v:
+                                dpg.set_axis_limits(f"v_y_{col}", self.scale_v[0], self.scale_v[1])
 
-                # Recent plots (right)
-                with dpg.group(tag="right_col"):
-                    with dpg.plot(label="Voltage", height=300, width=-1, tag="plot_v_recent"):
-                        dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="v_recent_x")
-                        dpg.add_plot_axis(dpg.mvYAxis, label="V", tag="v_recent_y")
-                        dpg.add_line_series([], [], label="V", parent="v_recent_y", tag="series_v_recent")
-                        if self.scale_v:
-                            dpg.set_axis_limits("v_recent_y", self.scale_v[0], self.scale_v[1])
+                        with dpg.plot(label=f"Power - {label}", height=300, width=-1, tag=f"plot_w_{col}"):
+                            dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag=f"w_x_{col}")
+                            dpg.add_plot_axis(dpg.mvYAxis, label="W", tag=f"w_y_{col}")
+                            dpg.add_line_series([], [], label="W", parent=f"w_y_{col}", tag=f"series_w_{col}")
+                            if self.scale_w:
+                                dpg.set_axis_limits(f"w_y_{col}", self.scale_w[0], self.scale_w[1])
 
-                    with dpg.plot(label="Power", height=300, width=-1, tag="plot_w_recent"):
-                        dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="w_recent_x")
-                        dpg.add_plot_axis(dpg.mvYAxis, label="W", tag="w_recent_y")
-                        dpg.add_line_series([], [], label="W", parent="w_recent_y", tag="series_w_recent")
-                        if self.scale_w:
-                            dpg.set_axis_limits("w_recent_y", self.scale_w[0], self.scale_w[1])
+                    # Add splitter after each column except the last
+                    if col < n - 1:
+                        dpg.add_button(label="", width=SPLITTER_WIDTH, height=300, tag=f"splitter_{col}")
+                        with dpg.item_handler_registry(tag=f"splitter_handler_{col}"):
+                            dpg.add_item_active_handler(callback=make_splitter_drag(col))
+                        dpg.bind_item_handler_registry(f"splitter_{col}", f"splitter_handler_{col}")
 
             # Status bar
             dpg.add_text("", tag="status_text")
@@ -449,10 +501,10 @@ class DearPyGuiDisplay:
         dpg.set_viewport_resize_callback(resize_plots)
         dpg.setup_dearpygui()
         dpg.show_viewport()
-        resize_plots()  # Initial sizing
+        resize_plots()
         self._initialized = True
 
-    def update(self, timestamp: float, reading: Reading, buffer: DualResolutionBuffer) -> None:
+    def update(self, timestamp: float, reading: Reading, buffer: CascadingBuffer) -> None:
         import dearpygui.dearpygui as dpg
 
         if not self._initialized:
@@ -461,35 +513,26 @@ class DearPyGuiDisplay:
         if not dpg.is_dearpygui_running():
             raise KeyboardInterrupt  # Signal to stop the main loop
 
-        # Extract data
-        recent_t = list(buffer.recent.timestamps)
-        recent_v = [r.voltage for r in buffer.recent.readings]
-        recent_w = [r.power for r in buffer.recent.readings]
+        # Update each column from buffer levels (reversed: col 0 = highest level)
+        n = min(self.num_columns, len(buffer.levels))
+        for col in range(n):
+            level_idx = n - 1 - col
+            level = buffer.levels[level_idx]
+            if not level.timestamps:
+                continue
 
-        history_t = list(buffer.history.timestamps)
-        history_v = [r.voltage for r in buffer.history.readings]
-        history_w = [r.power for r in buffer.history.readings]
+            t = list(level.timestamps)
+            v = [r.voltage for r in level.readings]
+            w = [r.power for r in level.readings]
 
-        # Update series data
-        if recent_t:
-            dpg.set_value("series_v_recent", [recent_t, recent_v])
-            dpg.set_value("series_w_recent", [recent_t, recent_w])
-            dpg.fit_axis_data("v_recent_x")
-            dpg.fit_axis_data("w_recent_x")
+            dpg.set_value(f"series_v_{col}", [t, v])
+            dpg.set_value(f"series_w_{col}", [t, w])
+            dpg.fit_axis_data(f"v_x_{col}")
+            dpg.fit_axis_data(f"w_x_{col}")
             if not self.scale_v:
-                dpg.fit_axis_data("v_recent_y")
+                dpg.fit_axis_data(f"v_y_{col}")
             if not self.scale_w:
-                dpg.fit_axis_data("w_recent_y")
-
-        if history_t:
-            dpg.set_value("series_v_hist", [history_t, history_v])
-            dpg.set_value("series_w_hist", [history_t, history_w])
-            dpg.fit_axis_data("v_hist_x")
-            dpg.fit_axis_data("w_hist_x")
-            if not self.scale_v:
-                dpg.fit_axis_data("v_hist_y")
-            if not self.scale_w:
-                dpg.fit_axis_data("w_hist_y")
+                dpg.fit_axis_data(f"w_y_{col}")
 
         # Update status
         dpg.set_value("status_text",
@@ -573,6 +616,7 @@ class Config:
 
     # Display mode
     display_mode: str = 'text'  # 'text', 'graph', 'gui'
+    num_columns: int = 2  # Number of time-scale columns (2-4)
     chart_time: float = 60.0
     history_time: float = 600.0
     avg_period: float = 1.0
@@ -608,11 +652,12 @@ def run(
     sinks: list[DataSink],
 ) -> None:
     """Main polling loop."""
-    buffer = DualResolutionBuffer(
-        recent=TimeSeries(max_samples=int(config.chart_time / config.period)),
-        history=TimeSeries(max_samples=int(config.history_time / config.avg_period)),
-        avg_period=config.avg_period,
-    )
+    # Create cascading buffer with num_columns levels
+    levels = [TimeSeries(max_samples=int(config.chart_time / config.period))]
+    for i in range(1, config.num_columns):
+        period = config.avg_period * (10 ** (i - 1))
+        levels.append(TimeSeries(max_samples=int(config.history_time / period)))
+    buffer = CascadingBuffer(levels=levels, base_period=config.avg_period)
 
     start_time = time.time()
 
@@ -680,6 +725,8 @@ def parse_args() -> Config:
                                help='Terminal graph mode (plotext)')
     display_group.add_argument('--gui', action='store_true',
                                help='Native GUI mode (DearPyGui)')
+    display_group.add_argument('-c', '--columns', type=int, default=2, choices=[2, 3, 4],
+                               help='Number of time-scale columns (default: 2)')
     display_group.add_argument('-t', '--chart-time', type=float, default=60.0,
                                help='Recent window in seconds (default: 60)')
     display_group.add_argument('-T', '--history-time', type=float, default=600.0,
@@ -705,6 +752,7 @@ def parse_args() -> Config:
         device=args.device,
         period=args.period,
         display_mode=display_mode,
+        num_columns=args.columns,
         chart_time=args.chart_time,
         history_time=args.history_time,
         avg_period=args.avg_period,
@@ -728,16 +776,18 @@ def main() -> None:
     match config.display_mode:
         case 'gui':
             display = DearPyGuiDisplay(
+                num_columns=config.num_columns,
+                poll_period=config.period,
                 scale_v=config.scale_v,
                 scale_w=config.scale_w,
-                history_time=config.history_time,
                 avg_period=config.avg_period,
             )
         case 'graph':
             display = TerminalGraphDisplay(
+                num_columns=config.num_columns,
+                poll_period=config.period,
                 scale_v=config.scale_v,
                 scale_w=config.scale_w,
-                history_time=config.history_time,
                 avg_period=config.avg_period,
             )
         case _:
