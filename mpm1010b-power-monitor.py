@@ -33,9 +33,10 @@ class Reading(NamedTuple):
 class LogAccumulator:
     """Accumulates readings and writes averaged values at fixed intervals."""
 
-    def __init__(self, file: IO[str], period: float):
+    def __init__(self, file: IO[str], period: float, minmax: bool = False):
         self.file = file
         self.period = period
+        self.minmax = minmax
         self.readings: list[Reading] = []
         self.last_write = 0.0
 
@@ -53,7 +54,24 @@ class LogAccumulator:
             sum(r.power_factor for r in self.readings) / n,
             sum(r.frequency for r in self.readings) / n,
         )
-        write_log_line(self.file, elapsed, avg)
+        if self.minmax:
+            min_r = Reading(
+                min(r.voltage for r in self.readings),
+                min(r.current for r in self.readings),
+                min(r.power for r in self.readings),
+                min(r.power_factor for r in self.readings),
+                min(r.frequency for r in self.readings),
+            )
+            max_r = Reading(
+                max(r.voltage for r in self.readings),
+                max(r.current for r in self.readings),
+                max(r.power for r in self.readings),
+                max(r.power_factor for r in self.readings),
+                max(r.frequency for r in self.readings),
+            )
+            write_log_line_minmax(self.file, elapsed, avg, min_r, max_r)
+        else:
+            write_log_line(self.file, elapsed, avg)
         self.readings.clear()
         self.last_write = elapsed
 
@@ -92,11 +110,14 @@ def parse_range(s: str) -> tuple[float, float]:
     return float(lo), float(hi)
 
 
-def write_log_header(f: IO[str]) -> None:
+def write_log_header(f: IO[str], minmax: bool = False) -> None:
     """Write TSV header to log file."""
     f.write("# MPM-1010B power log\n")
     f.write("# started: " + datetime.now().isoformat() + "\n")
-    f.write("timestamp\telapsed_s\tV\tA\tW\tPF\tHz\n")
+    if minmax:
+        f.write("timestamp\telapsed_s\tV\tV_min\tV_max\tA\tA_min\tA_max\tW\tW_min\tW_max\tPF\tHz\n")
+    else:
+        f.write("timestamp\telapsed_s\tV\tA\tW\tPF\tHz\n")
     f.flush()
 
 
@@ -104,6 +125,17 @@ def write_log_line(f: IO[str], elapsed: float, r: Reading) -> None:
     """Write a reading to log file."""
     ts = datetime.now().isoformat(timespec='milliseconds')
     f.write(f"{ts}\t{elapsed:.2f}\t{r.voltage:.2f}\t{r.current:.3f}\t{r.power:.2f}\t{r.power_factor:.3f}\t{r.frequency:.2f}\n")
+    f.flush()
+
+
+def write_log_line_minmax(f: IO[str], elapsed: float, avg: Reading, min_r: Reading, max_r: Reading) -> None:
+    """Write a reading with min/max to log file."""
+    ts = datetime.now().isoformat(timespec='milliseconds')
+    f.write(f"{ts}\t{elapsed:.2f}\t"
+            f"{avg.voltage:.2f}\t{min_r.voltage:.2f}\t{max_r.voltage:.2f}\t"
+            f"{avg.current:.3f}\t{min_r.current:.3f}\t{max_r.current:.3f}\t"
+            f"{avg.power:.2f}\t{min_r.power:.2f}\t{max_r.power:.2f}\t"
+            f"{avg.power_factor:.3f}\t{avg.frequency:.2f}\n")
     f.flush()
 
 
@@ -240,20 +272,22 @@ def main() -> None:
         description='Monitor MPM-1010B power meter',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='Examples:\n'
-               '  %(prog)s --graph                        Dual timescale graph (60s detail, 10min history)\n'
-               '  %(prog)s -g -t 30 -T 300 -a 2           30s detail, 5min history @ 2s avg\n'
+               '  %(prog)s --graph                        Dual timescale graph\n'
                '  %(prog)s -g -l build.tsv                Graph + log to file\n'
                '  %(prog)s -l build.tsv -p 0.1 -L 1       Poll 0.1s, log 1s averages\n'
+               '  %(prog)s -l build.tsv -p 0.1 -L 1 -M    Include min/max in log\n'
                '  %(prog)s --all                          Text mode, all readings\n'
     )
     parser.add_argument('-d', '--device', default='/dev/cu.PL2303G-USBtoUART3110',
                         help='Serial device path')
-    parser.add_argument('-p', '--period', type=float, default=0.2,
-                        help='Polling period in seconds (default: 0.2)')
+    parser.add_argument('-p', '--period', type=float, default=0.04,
+                        help='Polling period in seconds (default: 0.04 = 25Hz)')
     parser.add_argument('-l', '--log', type=Path, metavar='FILE',
                         help='Log readings to TSV file')
     parser.add_argument('-L', '--log-period', type=float, default=None, metavar='SEC',
                         help='Log averaging period (default: same as poll period)')
+    parser.add_argument('-M', '--log-minmax', action='store_true',
+                        help='Include min/max columns in log (for V, A, W)')
 
     # Text mode options
     text_group = parser.add_argument_group('text mode')
@@ -289,9 +323,10 @@ def main() -> None:
             logger = None
             if log_file:
                 log_period = args.log_period if args.log_period else args.period
-                write_log_header(log_file)
-                logger = LogAccumulator(log_file, log_period)
-                print(f"# Logging to {args.log} (period={log_period}s)", file=sys.stderr)
+                write_log_header(log_file, args.log_minmax)
+                logger = LogAccumulator(log_file, log_period, args.log_minmax)
+                minmax_str = ", minmax" if args.log_minmax else ""
+                print(f"# Logging to {args.log} (period={log_period}s{minmax_str})", file=sys.stderr)
 
             if args.graph:
                 run_graph_mode(ser, args, logger)
