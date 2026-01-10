@@ -18,7 +18,7 @@ Real-time AC power monitoring for the Matrix MPM-1010B power meter with multi-ti
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 - USB-to-serial adapter (PL2303 or similar)
-- Matrix MPM-1010B power meter
+- [Matrix MPM-1010B power meter](https://eleshop.eu/matrix-mpm-1010b-power-meter.html)
 
 ## Quick Start
 
