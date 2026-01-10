@@ -29,6 +29,26 @@ import serial
 
 
 # =============================================================================
+# Metrics Configuration
+# =============================================================================
+
+METRICS = {
+    'V': ('Voltage', 'V', 'voltage', 'cyan'),
+    'A': ('Current', 'A', 'current', 'green'),
+    'W': ('Power', 'W', 'power', 'yellow'),
+    'PF': ('Power Factor', '', 'power_factor', 'magenta'),
+    'Hz': ('Frequency', 'Hz', 'frequency', 'red'),
+}
+DEFAULT_METRICS = ['V', 'W']
+ALL_METRICS = list(METRICS.keys())
+
+
+def get_metric_value(reading: 'Reading', metric: str) -> float:
+    """Get the value of a metric from a reading."""
+    return getattr(reading, METRICS[metric][2])
+
+
+# =============================================================================
 # Data Model
 # =============================================================================
 
@@ -298,57 +318,53 @@ class TerminalGraphDisplay:
     """Plotext-based terminal graph display."""
     num_columns: int = 2
     poll_period: float = 0.04
-    scale_v: tuple[float, float] | None = None
-    scale_w: tuple[float, float] | None = None
+    metrics: list[str] = field(default_factory=lambda: DEFAULT_METRICS.copy())
     avg_period: float = 1.0
 
     def update(self, timestamp: float, reading: Reading, buffer: CascadingBuffer) -> None:
         import plotext as plt
 
         n = min(self.num_columns, len(buffer.levels))
+        num_metrics = len(self.metrics)
         plt.clear_figure()
-        plt.subplots(2, n)
+        plt.subplots(num_metrics, n)
 
         # Display columns right-to-left: rightmost = recent, leftmost = longest avg
         for col in range(n):
             level_idx = n - 1 - col  # Reverse: col 0 gets highest level
             level = buffer.levels[level_idx]
             t = list(level.timestamps) if level.timestamps else []
-            v = [r.voltage for r in level.readings] if level.readings else []
-            w = [r.power for r in level.readings] if level.readings else []
 
             # Column label
             if level_idx == 0:
                 hz = 1.0 / self.poll_period
-                label = f"{hz:.0f}Hz"
+                time_label = f"{hz:.0f}Hz"
             else:
                 period = self.avg_period * (10 ** (level_idx - 1))
-                label = f"{period:.0f}s avg" if period >= 1 else f"{period*1000:.0f}ms avg"
+                time_label = f"{period:.0f}s avg" if period >= 1 else f"{period*1000:.0f}ms avg"
 
-            # Voltage (top row)
-            plt.subplot(1, col + 1)
-            if t:
-                plt.plot(t, v, marker='braille', color='cyan')
-            if level_idx == 0:
-                plt.title(f'V: {reading.voltage:.1f}V - {label}')
-            else:
-                plt.title(f'Voltage - {label}')
-            plt.ylabel('V')
-            if self.scale_v:
-                plt.ylim(*self.scale_v)
+            # Plot each metric as a row
+            for row, metric in enumerate(self.metrics):
+                name, unit, attr, color = METRICS[metric]
+                values = [getattr(r, attr) for r in level.readings] if level.readings else []
 
-            # Power (bottom row)
-            plt.subplot(2, col + 1)
-            if t:
-                plt.plot(t, w, marker='braille', color='yellow')
-            if level_idx == 0:
-                plt.title(f'W: {reading.power:.1f}W  I={reading.current:.3f}A  PF={reading.power_factor:.2f}  {reading.frequency:.1f}Hz')
-            else:
-                plt.title(f'Power - {label}')
-            plt.ylabel('W')
-            plt.xlabel('Time (s)')
-            if self.scale_w:
-                plt.ylim(*self.scale_w)
+                plt.subplot(row + 1, col + 1)
+                if t:
+                    plt.plot(t, values, marker='braille', color=color)
+
+                # Title: show current value on rightmost column
+                if level_idx == 0:
+                    val = getattr(reading, attr)
+                    if unit:
+                        plt.title(f'{metric}: {val:.2f}{unit} - {time_label}')
+                    else:
+                        plt.title(f'{metric}: {val:.3f} - {time_label}')
+                else:
+                    plt.title(f'{name} - {time_label}')
+
+                plt.ylabel(unit if unit else metric)
+                if row == num_metrics - 1:
+                    plt.xlabel('Time (s)')
 
         plt.show()
 
@@ -393,8 +409,7 @@ class DearPyGuiDisplay:
     """DearPyGui-based native GUI display with implot."""
     num_columns: int = 2
     poll_period: float = 0.04
-    scale_v: tuple[float, float] | None = None
-    scale_w: tuple[float, float] | None = None
+    metrics: list[str] = field(default_factory=lambda: DEFAULT_METRICS.copy())
     avg_period: float = 1.0
     _initialized: bool = field(default=False, repr=False)
     _col_widths: list[float] = field(default_factory=list, repr=False)
@@ -408,6 +423,8 @@ class DearPyGuiDisplay:
 
         SPLITTER_WIDTH = 8
         n = self.num_columns
+        num_metrics = len(self.metrics)
+
         # Initialize equal column widths
         if not self._col_widths:
             self._col_widths = [1.0 / n] * n
@@ -416,16 +433,16 @@ class DearPyGuiDisplay:
             """Resize plots to fit viewport."""
             vp_height = dpg.get_viewport_height()
             vp_width = dpg.get_viewport_width()
-            plot_height = (vp_height - 60) // 2
-            content_height = plot_height * 2 + 8
+            plot_height = (vp_height - 60) // num_metrics
+            content_height = plot_height * num_metrics + 8
             num_splitters = n - 1
             usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - 16
 
-            for i in range(n):
-                col_width = int(usable_width * self._col_widths[i])
-                dpg.set_item_width(f"col_{i}", col_width)
-                dpg.set_item_height(f"plot_v_{i}", plot_height)
-                dpg.set_item_height(f"plot_w_{i}", plot_height)
+            for col in range(n):
+                col_width = int(usable_width * self._col_widths[col])
+                dpg.set_item_width(f"col_{col}", col_width)
+                for row, metric in enumerate(self.metrics):
+                    dpg.set_item_height(f"plot_{metric}_{col}", plot_height)
 
             for i in range(num_splitters):
                 dpg.set_item_height(f"splitter_{i}", content_height)
@@ -437,16 +454,13 @@ class DearPyGuiDisplay:
                 num_splitters = n - 1
                 usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - 16
 
-                # Calculate cumulative position up to this splitter
                 cumulative = sum(self._col_widths[:idx]) * usable_width + 8
                 for i in range(idx):
                     cumulative += SPLITTER_WIDTH
 
-                # New ratio for column idx
                 new_width = max(50, mouse_x - cumulative)
                 new_ratio = new_width / usable_width
 
-                # Adjust this column and take from the next
                 old_ratio = self._col_widths[idx]
                 delta = new_ratio - old_ratio
                 if self._col_widths[idx + 1] - delta > 0.1:
@@ -457,44 +471,33 @@ class DearPyGuiDisplay:
 
         with dpg.window(label="Power Monitor", tag="main_window", no_scrollbar=True):
             with dpg.group(horizontal=True):
-                # Display columns: leftmost = longest avg, rightmost = recent
                 for col in range(n):
-                    level_idx = n - 1 - col  # Reverse: col 0 gets highest level
+                    level_idx = n - 1 - col
 
-                    # Column label based on level
+                    # Column time label
                     if level_idx == 0:
                         hz = 1.0 / self.poll_period
-                        label = f"{hz:.0f}Hz"
+                        time_label = f"{hz:.0f}Hz"
                     else:
                         period = self.avg_period * (10 ** (level_idx - 1))
-                        if period >= 1:
-                            label = f"{period:.0f}s avg"
-                        else:
-                            label = f"{period*1000:.0f}ms avg"
+                        time_label = f"{period:.0f}s avg" if period >= 1 else f"{period*1000:.0f}ms avg"
 
                     with dpg.group(tag=f"col_{col}"):
-                        with dpg.plot(label=f"Voltage - {label}", height=300, width=-1, tag=f"plot_v_{col}"):
-                            dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag=f"v_x_{col}")
-                            dpg.add_plot_axis(dpg.mvYAxis, label="V", tag=f"v_y_{col}")
-                            dpg.add_line_series([], [], label="V", parent=f"v_y_{col}", tag=f"series_v_{col}")
-                            if self.scale_v:
-                                dpg.set_axis_limits(f"v_y_{col}", self.scale_v[0], self.scale_v[1])
+                        for metric in self.metrics:
+                            name, unit, attr, _ = METRICS[metric]
+                            ylabel = unit if unit else metric
 
-                        with dpg.plot(label=f"Power - {label}", height=300, width=-1, tag=f"plot_w_{col}"):
-                            dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag=f"w_x_{col}")
-                            dpg.add_plot_axis(dpg.mvYAxis, label="W", tag=f"w_y_{col}")
-                            dpg.add_line_series([], [], label="W", parent=f"w_y_{col}", tag=f"series_w_{col}")
-                            if self.scale_w:
-                                dpg.set_axis_limits(f"w_y_{col}", self.scale_w[0], self.scale_w[1])
+                            with dpg.plot(label=f"{name} - {time_label}", height=300, width=-1, tag=f"plot_{metric}_{col}"):
+                                dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag=f"{metric}_x_{col}")
+                                dpg.add_plot_axis(dpg.mvYAxis, label=ylabel, tag=f"{metric}_y_{col}")
+                                dpg.add_line_series([], [], label=metric, parent=f"{metric}_y_{col}", tag=f"series_{metric}_{col}")
 
-                    # Add splitter after each column except the last
                     if col < n - 1:
                         dpg.add_button(label="", width=SPLITTER_WIDTH, height=300, tag=f"splitter_{col}")
                         with dpg.item_handler_registry(tag=f"splitter_handler_{col}"):
                             dpg.add_item_active_handler(callback=make_splitter_drag(col))
                         dpg.bind_item_handler_registry(f"splitter_{col}", f"splitter_handler_{col}")
 
-            # Status bar
             dpg.add_text("", tag="status_text")
 
         dpg.set_primary_window("main_window", True)
@@ -511,9 +514,8 @@ class DearPyGuiDisplay:
             self._setup()
 
         if not dpg.is_dearpygui_running():
-            raise KeyboardInterrupt  # Signal to stop the main loop
+            raise KeyboardInterrupt
 
-        # Update each column from buffer levels (reversed: col 0 = highest level)
         n = min(self.num_columns, len(buffer.levels))
         for col in range(n):
             level_idx = n - 1 - col
@@ -522,24 +524,24 @@ class DearPyGuiDisplay:
                 continue
 
             t = list(level.timestamps)
-            v = [r.voltage for r in level.readings]
-            w = [r.power for r in level.readings]
 
-            dpg.set_value(f"series_v_{col}", [t, v])
-            dpg.set_value(f"series_w_{col}", [t, w])
-            dpg.fit_axis_data(f"v_x_{col}")
-            dpg.fit_axis_data(f"w_x_{col}")
-            if not self.scale_v:
-                dpg.fit_axis_data(f"v_y_{col}")
-            if not self.scale_w:
-                dpg.fit_axis_data(f"w_y_{col}")
+            for metric in self.metrics:
+                _, _, attr, _ = METRICS[metric]
+                values = [getattr(r, attr) for r in level.readings]
 
-        # Update status
-        dpg.set_value("status_text",
-            f"V={reading.voltage:.1f}V  I={reading.current:.3f}A  "
-            f"P={reading.power:.1f}W  PF={reading.power_factor:.2f}  "
-            f"f={reading.frequency:.1f}Hz"
-        )
+                dpg.set_value(f"series_{metric}_{col}", [t, values])
+                dpg.fit_axis_data(f"{metric}_x_{col}")
+                dpg.fit_axis_data(f"{metric}_y_{col}")
+
+        # Status bar with all metrics
+        status_parts = [
+            f"V={reading.voltage:.1f}V",
+            f"I={reading.current:.3f}A",
+            f"P={reading.power:.1f}W",
+            f"PF={reading.power_factor:.2f}",
+            f"f={reading.frequency:.1f}Hz",
+        ]
+        dpg.set_value("status_text", "  ".join(status_parts))
 
         dpg.render_dearpygui_frame()
 
@@ -617,6 +619,7 @@ class Config:
     # Display mode
     display_mode: str = 'text'  # 'text', 'graph', 'gui'
     num_columns: int = 3  # Number of time-scale columns (2-6)
+    metrics: list[str] = field(default_factory=lambda: DEFAULT_METRICS.copy())
     chart_time: float = 60.0
     history_time: float = 600.0
     avg_period: float = 1.0
@@ -739,8 +742,19 @@ def parse_args() -> Config:
                                help='Voltage axis range (e.g., 220:250)')
     display_group.add_argument('--scale-w', type=parse_range, metavar='MIN:MAX',
                                help='Power axis range (e.g., 0:100)')
+    display_group.add_argument('-m', '--metrics', default='V,W',
+                               help='Comma-separated metrics to plot: V,A,W,PF,Hz or "all" (default: V,W)')
 
     args = parser.parse_args()
+
+    # Parse metrics
+    if args.metrics.lower() == 'all':
+        metrics = ALL_METRICS.copy()
+    else:
+        metrics = [m.strip().upper() for m in args.metrics.split(',')]
+        for m in metrics:
+            if m not in METRICS:
+                parser.error(f"Unknown metric '{m}'. Valid: {', '.join(METRICS.keys())} or 'all'")
 
     # Determine display mode
     if args.gui:
@@ -755,6 +769,7 @@ def parse_args() -> Config:
         period=args.period,
         display_mode=display_mode,
         num_columns=args.columns,
+        metrics=metrics,
         chart_time=args.chart_time,
         history_time=args.history_time,
         avg_period=args.avg_period,
@@ -780,16 +795,14 @@ def main() -> None:
             display = DearPyGuiDisplay(
                 num_columns=config.num_columns,
                 poll_period=config.period,
-                scale_v=config.scale_v,
-                scale_w=config.scale_w,
+                metrics=config.metrics,
                 avg_period=config.avg_period,
             )
         case 'graph':
             display = TerminalGraphDisplay(
                 num_columns=config.num_columns,
                 poll_period=config.period,
-                scale_v=config.scale_v,
-                scale_w=config.scale_w,
+                metrics=config.metrics,
                 avg_period=config.avg_period,
             )
         case _:

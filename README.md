@@ -80,6 +80,22 @@ The columns display cascading 10x time averages. With default settings (600 samp
 | 5 | 7 days (1000s avg), 17 hr, 1.7 hr, 10 min, 1 min (25Hz) |
 | 6 | 69 days (10000s avg), 7 days, 17 hr, 1.7 hr, 10 min, 1 min (25Hz) |
 
+### Metrics Options
+
+| Option | Description |
+|--------|-------------|
+| `-m, --metrics LIST` | Comma-separated metrics to plot (default: V,W) |
+
+Available metrics:
+- `V` - Voltage
+- `A` - Current
+- `W` - Power
+- `PF` - Power Factor
+- `Hz` - Frequency
+- `all` - All metrics
+
+Example: `--metrics V,W,Hz` or `-m all`
+
 ### Scale Options
 
 | Option | Description |
@@ -120,6 +136,12 @@ The columns display cascading 10x time averages. With default settings (600 samp
 
 # Force takeover of serial port
 ./mpm1010b-power-monitor.py --gui -f
+
+# Plot all metrics (V, A, W, PF, Hz)
+./mpm1010b-power-monitor.py --gui -m all
+
+# Plot only voltage and frequency
+./mpm1010b-power-monitor.py --gui -m V,Hz
 ```
 
 ## Output Format
