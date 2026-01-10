@@ -62,13 +62,25 @@ def parse_range(s: str) -> tuple[float, float]:
 
 
 def run_graph_mode(ser: serial.Serial, args: argparse.Namespace) -> None:
-    """Run live graph display."""
+    """Run live graph display with dual timescales."""
     import plotext as plt
 
-    max_samples = int(args.chart_time / args.period)
-    timestamps: deque[float] = deque(maxlen=max_samples)
-    voltages: deque[float] = deque(maxlen=max_samples)
-    powers: deque[float] = deque(maxlen=max_samples)
+    # Recent (detail) buffers - high resolution
+    max_recent = int(args.chart_time / args.period)
+    recent_t: deque[float] = deque(maxlen=max_recent)
+    recent_v: deque[float] = deque(maxlen=max_recent)
+    recent_w: deque[float] = deque(maxlen=max_recent)
+
+    # History (rolloff) buffers - averaged, longer timespan
+    max_history = int(args.history_time / args.avg_period)
+    history_t: deque[float] = deque(maxlen=max_history)
+    history_v: deque[float] = deque(maxlen=max_history)
+    history_w: deque[float] = deque(maxlen=max_history)
+
+    # Accumulator for averaging
+    acc_v: list[float] = []
+    acc_w: list[float] = []
+    last_avg_time = 0.0
 
     start_time = time.time()
 
@@ -79,26 +91,57 @@ def run_graph_mode(ser: serial.Serial, args: argparse.Namespace) -> None:
             continue
 
         now = time.time() - start_time
-        timestamps.append(now)
-        voltages.append(reading.voltage)
-        powers.append(reading.power)
+        recent_t.append(now)
+        recent_v.append(reading.voltage)
+        recent_w.append(reading.power)
+
+        # Accumulate for averaging
+        acc_v.append(reading.voltage)
+        acc_w.append(reading.power)
+
+        # Roll off averaged data to history
+        if now - last_avg_time >= args.avg_period and acc_v:
+            history_t.append(now)
+            history_v.append(sum(acc_v) / len(acc_v))
+            history_w.append(sum(acc_w) / len(acc_w))
+            acc_v.clear()
+            acc_w.clear()
+            last_avg_time = now
 
         plt.clear_figure()
-        plt.subplots(2, 1)
 
-        # Voltage plot
+        # 2 rows × 2 columns: [history_v, recent_v] / [history_w, recent_w]
+        plt.subplots(2, 2)
+
+        # Voltage history (top-left)
         plt.subplot(1, 1)
-        plt.plot(list(timestamps), list(voltages), marker='braille', color='cyan')
-        plt.title(f'Voltage: {reading.voltage:.1f} V')
+        if history_t:
+            plt.plot(list(history_t), list(history_v), marker='braille', color='cyan')
+        plt.title(f'History ({args.history_time:.0f}s @ {args.avg_period:.1f}s avg)')
         plt.ylabel('V')
         if args.scale_v:
             plt.ylim(*args.scale_v)
 
-        # Power plot
+        # Voltage recent (top-right)
+        plt.subplot(1, 2)
+        plt.plot(list(recent_t), list(recent_v), marker='braille', color='cyan')
+        plt.title(f'Voltage: {reading.voltage:.1f} V')
+        if args.scale_v:
+            plt.ylim(*args.scale_v)
+
+        # Power history (bottom-left)
         plt.subplot(2, 1)
-        plt.plot(list(timestamps), list(powers), marker='braille', color='yellow')
-        plt.title(f'Power: {reading.power:.1f} W  (I={reading.current:.3f}A  PF={reading.power_factor:.2f}  {reading.frequency:.1f}Hz)')
+        if history_t:
+            plt.plot(list(history_t), list(history_w), marker='braille', color='yellow')
         plt.ylabel('W')
+        plt.xlabel('Time (s)')
+        if args.scale_w:
+            plt.ylim(*args.scale_w)
+
+        # Power recent (bottom-right)
+        plt.subplot(2, 2)
+        plt.plot(list(recent_t), list(recent_w), marker='braille', color='yellow')
+        plt.title(f'Power: {reading.power:.1f} W  (I={reading.current:.3f}A  PF={reading.power_factor:.2f}  {reading.frequency:.1f}Hz)')
         plt.xlabel('Time (s)')
         if args.scale_w:
             plt.ylim(*args.scale_w)
@@ -142,10 +185,11 @@ def main() -> None:
         description='Monitor MPM-1010B power meter',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='Examples:\n'
-               '  %(prog)s --graph                    Live graph with defaults\n'
-               '  %(prog)s --graph -t 120             Graph last 2 minutes\n'
-               '  %(prog)s --graph --scale-v 220:250  Fixed voltage scale\n'
-               '  %(prog)s --all                      Text mode, all readings\n'
+               '  %(prog)s --graph                        Dual timescale graph (60s detail, 10min history)\n'
+               '  %(prog)s -g -t 30 -T 300 -a 2           30s detail, 5min history @ 2s avg\n'
+               '  %(prog)s -g -p 0.1 -a 1                 Fast poll (0.1s), 1s averaging\n'
+               '  %(prog)s --graph --scale-v 220:250      Fixed voltage scale\n'
+               '  %(prog)s --all                          Text mode, all readings\n'
     )
     parser.add_argument('-d', '--device', default='/dev/cu.PL2303G-USBtoUART3110',
                         help='Serial device path')
@@ -166,7 +210,11 @@ def main() -> None:
     graph_group.add_argument('-g', '--graph', action='store_true',
                              help='Enable live graph mode')
     graph_group.add_argument('-t', '--chart-time', type=float, default=60.0,
-                             help='Time window to display in seconds (default: 60)')
+                             help='Recent window in seconds (default: 60)')
+    graph_group.add_argument('-T', '--history-time', type=float, default=600.0,
+                             help='History window in seconds (default: 600)')
+    graph_group.add_argument('-a', '--avg-period', type=float, default=1.0,
+                             help='Averaging period for history in seconds (default: 1.0)')
     graph_group.add_argument('--scale-v', type=parse_range, metavar='MIN:MAX',
                              help='Voltage axis range (e.g., 220:250)')
     graph_group.add_argument('--scale-w', type=parse_range, metavar='MIN:MAX',
