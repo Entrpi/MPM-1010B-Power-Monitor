@@ -221,6 +221,11 @@ class CascadingBuffer:
         self._accumulators = [[] for _ in range(len(self.levels) - 1)]
         self._last_times = [0.0] * (len(self.levels) - 1)
 
+    def set_last_time(self, timestamp: float) -> None:
+        """Set the last cascade time for all levels (used after loading history)."""
+        for i in range(len(self._last_times)):
+            self._last_times[i] = timestamp
+
     def period_for_level(self, level: int) -> float:
         """Get the averaging period for a given level (1+)."""
         if level <= 0:
@@ -842,8 +847,11 @@ class BinaryLogger:
             return 0.0
 
         # Second pass: load data for each level
-        for level in range(len(buffer.levels)):
-            files = list(base_path.glob(f"level_{level}_*.bin"))
+        # Skip level 0 (realtime) - it's sized for raw samples, not 1s aggregates
+        for level in range(1, len(buffer.levels)):
+            # Binary level index is one less than buffer level (binary level 0 = 1s avg = buffer level 1)
+            bin_level = level - 1
+            files = list(base_path.glob(f"level_{bin_level}_*.bin"))
             if not files:
                 continue
 
@@ -1115,6 +1123,9 @@ def main() -> None:
                 if start_time > 0:
                     elapsed = time.time() - start_time
                     print(f"# Loaded history from {elapsed:.0f}s ago", file=sys.stderr)
+                    # Set last cascade time so new data integrates smoothly
+                    current_relative = time.time() - start_time
+                    buffer.set_last_time(current_relative)
                 else:
                     start_time = None
             binary_logger.open()
