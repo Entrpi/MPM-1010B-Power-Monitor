@@ -1,13 +1,13 @@
-#!/usr/bin/env -S uv run --with pyserial,plotext python3
+#!/usr/bin/env -S uv run --with pyserial,plotext,dearpygui python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pyserial", "plotext"]
+# dependencies = ["pyserial", "plotext", "dearpygui"]
 # ///
 """
 MPM-1010B AC Power Meter Monitor
 
 Polls the meter and outputs readings via pluggable display backends.
-Supports terminal graphs, text output, and file logging.
+Supports terminal graphs, native GUI, text output, and file logging.
 """
 
 from __future__ import annotations
@@ -185,11 +185,27 @@ class MeterReader:
 
 
 # =============================================================================
+# Sink Protocol (for data destinations like files, databases, MQTT)
+# =============================================================================
+
+class DataSink(Protocol):
+    """Protocol for data sinks (file loggers, databases, message queues)."""
+
+    def add(self, timestamp: float, reading: Reading) -> None:
+        """Add a reading to the sink."""
+        ...
+
+    def close(self) -> None:
+        """Flush and clean up resources."""
+        ...
+
+
+# =============================================================================
 # Display Protocol & Implementations
 # =============================================================================
 
 class Display(Protocol):
-    """Protocol for display backends."""
+    """Protocol for display backends (visualization)."""
 
     def update(self, timestamp: float, reading: Reading, buffer: DualResolutionBuffer) -> None:
         """Update the display with new data."""
@@ -295,8 +311,120 @@ class TextDisplay:
         pass
 
 
+@dataclass
+class DearPyGuiDisplay:
+    """DearPyGui-based native GUI display with implot."""
+    scale_v: tuple[float, float] | None = None
+    scale_w: tuple[float, float] | None = None
+    history_time: float = 600.0
+    avg_period: float = 1.0
+    _initialized: bool = field(default=False, repr=False)
+
+    def _setup(self) -> None:
+        """Initialize DearPyGui context and window."""
+        import dearpygui.dearpygui as dpg
+
+        dpg.create_context()
+        dpg.create_viewport(title='MPM-1010B Power Monitor', width=1200, height=700)
+
+        with dpg.window(label="Power Monitor", tag="main_window"):
+            with dpg.group(horizontal=True):
+                # History plots (left)
+                with dpg.child_window(width=580, height=-1):
+                    with dpg.plot(label="Voltage History", height=300, width=-1, tag="plot_v_hist"):
+                        dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="v_hist_x")
+                        dpg.add_plot_axis(dpg.mvYAxis, label="V", tag="v_hist_y")
+                        dpg.add_line_series([], [], label="V", parent="v_hist_y", tag="series_v_hist")
+                        if self.scale_v:
+                            dpg.set_axis_limits("v_hist_y", self.scale_v[0], self.scale_v[1])
+
+                    with dpg.plot(label="Power History", height=300, width=-1, tag="plot_w_hist"):
+                        dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="w_hist_x")
+                        dpg.add_plot_axis(dpg.mvYAxis, label="W", tag="w_hist_y")
+                        dpg.add_line_series([], [], label="W", parent="w_hist_y", tag="series_w_hist")
+                        if self.scale_w:
+                            dpg.set_axis_limits("w_hist_y", self.scale_w[0], self.scale_w[1])
+
+                # Recent plots (right)
+                with dpg.child_window(width=-1, height=-1):
+                    with dpg.plot(label="Voltage", height=300, width=-1, tag="plot_v_recent"):
+                        dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="v_recent_x")
+                        dpg.add_plot_axis(dpg.mvYAxis, label="V", tag="v_recent_y")
+                        dpg.add_line_series([], [], label="V", parent="v_recent_y", tag="series_v_recent")
+                        if self.scale_v:
+                            dpg.set_axis_limits("v_recent_y", self.scale_v[0], self.scale_v[1])
+
+                    with dpg.plot(label="Power", height=300, width=-1, tag="plot_w_recent"):
+                        dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="w_recent_x")
+                        dpg.add_plot_axis(dpg.mvYAxis, label="W", tag="w_recent_y")
+                        dpg.add_line_series([], [], label="W", parent="w_recent_y", tag="series_w_recent")
+                        if self.scale_w:
+                            dpg.set_axis_limits("w_recent_y", self.scale_w[0], self.scale_w[1])
+
+            # Status bar
+            dpg.add_text("", tag="status_text")
+
+        dpg.set_primary_window("main_window", True)
+        dpg.setup_dearpygui()
+        dpg.show_viewport()
+        self._initialized = True
+
+    def update(self, timestamp: float, reading: Reading, buffer: DualResolutionBuffer) -> None:
+        import dearpygui.dearpygui as dpg
+
+        if not self._initialized:
+            self._setup()
+
+        if not dpg.is_dearpygui_running():
+            raise KeyboardInterrupt  # Signal to stop the main loop
+
+        # Extract data
+        recent_t = list(buffer.recent.timestamps)
+        recent_v = [r.voltage for r in buffer.recent.readings]
+        recent_w = [r.power for r in buffer.recent.readings]
+
+        history_t = list(buffer.history.timestamps)
+        history_v = [r.voltage for r in buffer.history.readings]
+        history_w = [r.power for r in buffer.history.readings]
+
+        # Update series data
+        if recent_t:
+            dpg.set_value("series_v_recent", [recent_t, recent_v])
+            dpg.set_value("series_w_recent", [recent_t, recent_w])
+            dpg.fit_axis_data("v_recent_x")
+            dpg.fit_axis_data("w_recent_x")
+            if not self.scale_v:
+                dpg.fit_axis_data("v_recent_y")
+            if not self.scale_w:
+                dpg.fit_axis_data("w_recent_y")
+
+        if history_t:
+            dpg.set_value("series_v_hist", [history_t, history_v])
+            dpg.set_value("series_w_hist", [history_t, history_w])
+            dpg.fit_axis_data("v_hist_x")
+            dpg.fit_axis_data("w_hist_x")
+            if not self.scale_v:
+                dpg.fit_axis_data("v_hist_y")
+            if not self.scale_w:
+                dpg.fit_axis_data("w_hist_y")
+
+        # Update status
+        dpg.set_value("status_text",
+            f"V={reading.voltage:.1f}V  I={reading.current:.3f}A  "
+            f"P={reading.power:.1f}W  PF={reading.power_factor:.2f}  "
+            f"f={reading.frequency:.1f}Hz"
+        )
+
+        dpg.render_dearpygui_frame()
+
+    def close(self) -> None:
+        if self._initialized:
+            import dearpygui.dearpygui as dpg
+            dpg.destroy_context()
+
+
 # =============================================================================
-# File Logging
+# Data Sinks
 # =============================================================================
 
 @dataclass
@@ -361,7 +489,7 @@ class Config:
     period: float = 0.04  # 25 Hz
 
     # Display mode
-    graph_mode: bool = False
+    display_mode: str = 'text'  # 'text', 'graph', 'gui'
     chart_time: float = 60.0
     history_time: float = 600.0
     avg_period: float = 1.0
@@ -387,7 +515,12 @@ class Config:
 # Main Loop
 # =============================================================================
 
-def run(meter: MeterReader, config: Config, display: Display, logger: FileLogger | None) -> None:
+def run(
+    meter: MeterReader,
+    config: Config,
+    display: Display,
+    sinks: list[DataSink],
+) -> None:
     """Main polling loop."""
     buffer = DualResolutionBuffer(
         recent=TimeSeries(max_samples=int(config.chart_time / config.period)),
@@ -406,8 +539,8 @@ def run(meter: MeterReader, config: Config, display: Display, logger: FileLogger
         timestamp = time.time() - start_time
         buffer.append(timestamp, reading)
 
-        if logger:
-            logger.add(timestamp, reading)
+        for sink in sinks:
+            sink.add(timestamp, reading)
 
         display.update(timestamp, reading, buffer)
         time.sleep(config.period)
@@ -429,10 +562,10 @@ def parse_args() -> Config:
         description='Monitor MPM-1010B power meter',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='Examples:\n'
-               '  %(prog)s --graph                        Dual timescale graph\n'
+               '  %(prog)s --gui                          Native GUI window\n'
+               '  %(prog)s --graph                        Terminal graph\n'
                '  %(prog)s -g -l build.tsv                Graph + log to file\n'
-               '  %(prog)s -l build.tsv -p 0.1 -L 1       Poll 0.1s, log 1s averages\n'
-               '  %(prog)s -l build.tsv -p 0.1 -L 1 -M    Include min/max in log\n'
+               '  %(prog)s -l build.tsv -p 0.1 -L 1 -M    Log with min/max\n'
                '  %(prog)s --all                          Text mode, all readings\n'
     )
     parser.add_argument('-d', '--device', default='/dev/cu.PL2303G-USBtoUART3110',
@@ -454,26 +587,36 @@ def parse_args() -> Config:
     text_group.add_argument('--all', action='store_true',
                             help='Output every reading (ignore thresholds)')
 
-    graph_group = parser.add_argument_group('graph mode')
-    graph_group.add_argument('-g', '--graph', action='store_true',
-                             help='Enable live graph mode')
-    graph_group.add_argument('-t', '--chart-time', type=float, default=60.0,
-                             help='Recent window in seconds (default: 60)')
-    graph_group.add_argument('-T', '--history-time', type=float, default=600.0,
-                             help='History window in seconds (default: 600)')
-    graph_group.add_argument('-a', '--avg-period', type=float, default=1.0,
-                             help='Averaging period for history in seconds (default: 1.0)')
-    graph_group.add_argument('--scale-v', type=parse_range, metavar='MIN:MAX',
-                             help='Voltage axis range (e.g., 220:250)')
-    graph_group.add_argument('--scale-w', type=parse_range, metavar='MIN:MAX',
-                             help='Power axis range (e.g., 0:100)')
+    display_group = parser.add_argument_group('display mode')
+    display_group.add_argument('-g', '--graph', action='store_true',
+                               help='Terminal graph mode (plotext)')
+    display_group.add_argument('--gui', action='store_true',
+                               help='Native GUI mode (DearPyGui)')
+    display_group.add_argument('-t', '--chart-time', type=float, default=60.0,
+                               help='Recent window in seconds (default: 60)')
+    display_group.add_argument('-T', '--history-time', type=float, default=600.0,
+                               help='History window in seconds (default: 600)')
+    display_group.add_argument('-a', '--avg-period', type=float, default=1.0,
+                               help='Averaging period for history in seconds (default: 1.0)')
+    display_group.add_argument('--scale-v', type=parse_range, metavar='MIN:MAX',
+                               help='Voltage axis range (e.g., 220:250)')
+    display_group.add_argument('--scale-w', type=parse_range, metavar='MIN:MAX',
+                               help='Power axis range (e.g., 0:100)')
 
     args = parser.parse_args()
+
+    # Determine display mode
+    if args.gui:
+        display_mode = 'gui'
+    elif args.graph:
+        display_mode = 'graph'
+    else:
+        display_mode = 'text'
 
     return Config(
         device=args.device,
         period=args.period,
-        graph_mode=args.graph,
+        display_mode=display_mode,
         chart_time=args.chart_time,
         history_time=args.history_time,
         avg_period=args.avg_period,
@@ -491,25 +634,35 @@ def parse_args() -> Config:
 def main() -> None:
     config = parse_args()
 
-    # Create display
-    if config.graph_mode:
-        display: Display = TerminalGraphDisplay(
-            scale_v=config.scale_v,
-            scale_w=config.scale_w,
-            history_time=config.history_time,
-            avg_period=config.avg_period,
-        )
-    else:
-        display = TextDisplay(
-            volts_threshold=config.volts_threshold,
-            watts_threshold=config.watts_threshold,
-            show_all=config.show_all,
-        )
+    # Create display based on mode
+    display: Display
+    match config.display_mode:
+        case 'gui':
+            display = DearPyGuiDisplay(
+                scale_v=config.scale_v,
+                scale_w=config.scale_w,
+                history_time=config.history_time,
+                avg_period=config.avg_period,
+            )
+        case 'graph':
+            display = TerminalGraphDisplay(
+                scale_v=config.scale_v,
+                scale_w=config.scale_w,
+                history_time=config.history_time,
+                avg_period=config.avg_period,
+            )
+        case _:
+            display = TextDisplay(
+                volts_threshold=config.volts_threshold,
+                watts_threshold=config.watts_threshold,
+                show_all=config.show_all,
+            )
+
+    sinks: list[DataSink] = []
 
     try:
         log_ctx = open(config.log_path, 'w') if config.log_path else nullcontext()
         with log_ctx as log_file, MeterReader(config.device) as meter:
-            logger = None
             if log_file:
                 logger = FileLogger(
                     file=log_file,
@@ -517,10 +670,11 @@ def main() -> None:
                     include_minmax=config.log_minmax,
                 )
                 logger.write_header()
+                sinks.append(logger)
                 minmax_str = ", minmax" if config.log_minmax else ""
                 print(f"# Logging to {config.log_path} (period={config.effective_log_period}s{minmax_str})", file=sys.stderr)
 
-            run(meter, config, display, logger)
+            run(meter, config, display, sinks)
 
     except KeyboardInterrupt:
         print("\n# Stopped", file=sys.stderr)
@@ -528,6 +682,8 @@ def main() -> None:
         sys.exit(f"Serial error: {e}")
     finally:
         display.close()
+        for sink in sinks:
+            sink.close()
 
 
 if __name__ == '__main__':
