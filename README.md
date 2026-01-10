@@ -11,6 +11,7 @@ Real-time AC power monitoring for the Matrix MPM-1010B power meter with multi-ti
 - **Terminal graphs**: Braille-character plots for SSH/headless use
 - **Text output**: Tab-separated values for piping to other tools
 - **File logging**: TSV output with configurable averaging and optional min/max tracking
+- **Persistent history**: Binary storage with cascading aggregation, survives restarts
 - **Force takeover**: Automatically kill other processes holding the serial port
 
 ## Requirements
@@ -39,10 +40,11 @@ The script uses `uv` for automatic dependency management. Dependencies (pyserial
 
 ```
 usage: mpm1010b-power-monitor.py [-h] [-d DEVICE] [-f] [-p PERIOD] [-l FILE]
-                                 [-L SEC] [-M] [-w WATTS] [-v VOLTS] [--all]
-                                 [-g] [--gui] [-c {2,3,4}] [-t CHART_TIME]
-                                 [-T HISTORY_TIME] [-a AVG_PERIOD]
-                                 [--scale-v MIN:MAX] [--scale-w MIN:MAX]
+                                 [-L SEC] [-M] [--db [PATH]] [-w WATTS]
+                                 [-v VOLTS] [--all] [-g] [--gui] [-c {2-6}]
+                                 [-t CHART_TIME] [-T HISTORY_TIME]
+                                 [-a AVG_PERIOD] [--scale-v MIN:MAX]
+                                 [--scale-w MIN:MAX] [-m METRICS]
 ```
 
 ### Core Options
@@ -119,6 +121,19 @@ Example: `--metrics V,W,Hz` or `-m all`
 | `-L, --log-period SEC` | Log averaging period (default: same as poll) |
 | `-M, --log-minmax` | Include min/max columns in log |
 
+### Persistence Options
+
+| Option | Description |
+|--------|-------------|
+| `--db [PATH]` | Binary database directory (default: `./data` when enabled) |
+
+The `--db` option enables persistent history storage. Data is saved in binary format with cascading aggregation levels matching the display columns. On restart, history is automatically reloaded and new data continues from where it left off.
+
+Storage format:
+- 52 bytes per record (timestamp + V/A/W with avg/min/max + PF/Hz avg)
+- Separate files per cascade level (`level_0_1s.bin`, `level_1_10s.bin`, etc.)
+- ~1.7 GB/year for all cascade levels with default settings
+
 ## Examples
 
 ```bash
@@ -142,6 +157,12 @@ Example: `--metrics V,W,Hz` or `-m all`
 
 # Plot only voltage and frequency
 ./mpm1010b-power-monitor.py --gui -m V,Hz
+
+# GUI with persistent history (survives restarts)
+./mpm1010b-power-monitor.py --gui --db
+
+# Custom database path
+./mpm1010b-power-monitor.py --gui --db /path/to/data
 ```
 
 ## Output Format
@@ -199,7 +220,7 @@ CascadingBuffer      - Multi-level time series with 10x averaging cascade
     |
     +---> Display    - Visualization (GUI, terminal graph, or text)
     |
-    +---> DataSink   - File logging with averaging
+    +---> DataSink   - File logging (TSV) or binary persistence
 ```
 
 The `CascadingBuffer` maintains multiple `TimeSeries` at different time resolutions:

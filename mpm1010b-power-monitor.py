@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import IO, Protocol, Self, Sequence
 
 import serial
+import struct
 
 
 # =============================================================================
@@ -93,6 +94,94 @@ class Reading:
             power=max(r.power for r in readings),
             power_factor=max(r.power_factor for r in readings),
             frequency=max(r.frequency for r in readings),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AggregatedReading:
+    """Aggregated reading with min/max for V, A, W and avg for PF, Hz."""
+    timestamp: float
+    voltage_avg: float
+    voltage_min: float
+    voltage_max: float
+    current_avg: float
+    current_min: float
+    current_max: float
+    power_avg: float
+    power_min: float
+    power_max: float
+    power_factor_avg: float
+    frequency_avg: float
+
+    # Binary format: 52 bytes
+    STRUCT_FORMAT = '<d 3f 3f 3f f f'  # little-endian: 1 double + 11 floats
+    STRUCT_SIZE = struct.calcsize(STRUCT_FORMAT)
+
+    @classmethod
+    def from_readings(cls, timestamp: float, readings: Sequence[Reading]) -> Self:
+        """Create aggregated reading from a sequence of raw readings."""
+        avg = Reading.average(readings)
+        min_r = Reading.min(readings)
+        max_r = Reading.max(readings)
+        return cls(
+            timestamp=timestamp,
+            voltage_avg=avg.voltage, voltage_min=min_r.voltage, voltage_max=max_r.voltage,
+            current_avg=avg.current, current_min=min_r.current, current_max=max_r.current,
+            power_avg=avg.power, power_min=min_r.power, power_max=max_r.power,
+            power_factor_avg=avg.power_factor,
+            frequency_avg=avg.frequency,
+        )
+
+    @classmethod
+    def from_aggregates(cls, timestamp: float, aggs: Sequence[Self]) -> Self:
+        """Create higher-level aggregate preserving true min/max."""
+        n = len(aggs)
+        return cls(
+            timestamp=timestamp,
+            voltage_avg=sum(a.voltage_avg for a in aggs) / n,
+            voltage_min=min(a.voltage_min for a in aggs),
+            voltage_max=max(a.voltage_max for a in aggs),
+            current_avg=sum(a.current_avg for a in aggs) / n,
+            current_min=min(a.current_min for a in aggs),
+            current_max=max(a.current_max for a in aggs),
+            power_avg=sum(a.power_avg for a in aggs) / n,
+            power_min=min(a.power_min for a in aggs),
+            power_max=max(a.power_max for a in aggs),
+            power_factor_avg=sum(a.power_factor_avg for a in aggs) / n,
+            frequency_avg=sum(a.frequency_avg for a in aggs) / n,
+        )
+
+    def to_reading(self) -> Reading:
+        """Convert to a simple Reading (using averages)."""
+        return Reading(
+            voltage=self.voltage_avg,
+            current=self.current_avg,
+            power=self.power_avg,
+            power_factor=self.power_factor_avg,
+            frequency=self.frequency_avg,
+        )
+
+    def pack(self) -> bytes:
+        """Serialize to binary."""
+        return struct.pack(
+            self.STRUCT_FORMAT,
+            self.timestamp,
+            self.voltage_avg, self.voltage_min, self.voltage_max,
+            self.current_avg, self.current_min, self.current_max,
+            self.power_avg, self.power_min, self.power_max,
+            self.power_factor_avg, self.frequency_avg,
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> Self:
+        """Deserialize from binary."""
+        values = struct.unpack(cls.STRUCT_FORMAT, data)
+        return cls(
+            timestamp=values[0],
+            voltage_avg=values[1], voltage_min=values[2], voltage_max=values[3],
+            current_avg=values[4], current_min=values[5], current_max=values[6],
+            power_avg=values[7], power_min=values[8], power_max=values[9],
+            power_factor_avg=values[10], frequency_avg=values[11],
         )
 
 
@@ -606,6 +695,179 @@ class FileLogger:
         pass
 
 
+@dataclass
+class BinaryLogger:
+    """Cascading binary logger with min/max preservation.
+
+    Writes aggregated readings to separate files per cascade level.
+    File format: 32-byte header + N × 52-byte records.
+    """
+    base_path: Path
+    base_period: float = 1.0  # Level 1 averaging period
+    num_levels: int = 5       # Number of cascade levels to store
+    _files: list[IO[bytes]] = field(default_factory=list, repr=False)
+    _accumulators: list[list] = field(default_factory=list, repr=False)
+    _last_times: list[float] = field(default_factory=list, repr=False)
+    _start_time: float = field(default=0.0, repr=False)
+
+    # Header format: magic(8) + version(4) + level(4) + base_period(8) + start_time(8)
+    HEADER_FORMAT = '<8s I I d d'
+    HEADER_SIZE = 32
+    MAGIC = b'MPM1010B'
+    VERSION = 1
+
+    def __post_init__(self):
+        self._accumulators = [[] for _ in range(self.num_levels)]
+        self._last_times = [0.0] * self.num_levels
+        self._start_time = time.time()
+
+    def open(self) -> None:
+        """Open or create binary log files for each level."""
+        self.base_path.mkdir(parents=True, exist_ok=True)
+
+        for level in range(self.num_levels):
+            period = self.base_period * (10 ** level)
+            path = self.base_path / f"level_{level}_{period:.0f}s.bin"
+
+            if path.exists():
+                # Append mode - verify header
+                f = open(path, 'r+b')
+                header = f.read(self.HEADER_SIZE)
+                magic, version, file_level, file_period, start_time = struct.unpack(
+                    self.HEADER_FORMAT, header
+                )
+                if magic != self.MAGIC or file_level != level:
+                    raise ValueError(f"Invalid log file: {path}")
+                f.seek(0, 2)  # Seek to end
+                self._start_time = start_time
+            else:
+                # Create new file with header
+                f = open(path, 'wb')
+                header = struct.pack(
+                    self.HEADER_FORMAT,
+                    self.MAGIC, self.VERSION, level,
+                    self.base_period * (10 ** level),
+                    self._start_time
+                )
+                f.write(header)
+
+            self._files.append(f)
+
+    def add(self, timestamp: float, reading: Reading) -> None:
+        """Add a reading, cascading through levels.
+
+        Args:
+            timestamp: Relative timestamp (elapsed time since session start)
+            reading: Raw meter reading
+        """
+        # Level 0: aggregate raw readings into 1s (base_period) chunks
+        self._accumulators[0].append(reading)
+
+        if timestamp - self._last_times[0] >= self.base_period and self._accumulators[0]:
+            # Create level 0 aggregate - use current absolute time
+            abs_time = time.time()
+            agg = AggregatedReading.from_readings(abs_time, self._accumulators[0])
+            self._write_record(0, agg)
+            self._accumulators[0].clear()
+            self._last_times[0] = timestamp
+
+            # Cascade to higher levels
+            self._cascade(1, agg, timestamp)
+
+    def _cascade(self, level: int, agg: AggregatedReading, timestamp: float) -> None:
+        """Cascade an aggregate up through higher levels."""
+        if level >= self.num_levels:
+            return
+
+        self._accumulators[level].append(agg)
+        period = self.base_period * (10 ** level)
+
+        if timestamp - self._last_times[level] >= period and self._accumulators[level]:
+            # Use the timestamp from the most recent aggregate
+            higher_agg = AggregatedReading.from_aggregates(
+                agg.timestamp,
+                self._accumulators[level]
+            )
+            self._write_record(level, higher_agg)
+            self._accumulators[level].clear()
+            self._last_times[level] = timestamp
+
+            self._cascade(level + 1, higher_agg, timestamp)
+
+    def _write_record(self, level: int, agg: AggregatedReading) -> None:
+        """Write a record to the appropriate level file."""
+        self._files[level].write(agg.pack())
+        self._files[level].flush()
+
+    def close(self) -> None:
+        """Close all files."""
+        for f in self._files:
+            f.close()
+        self._files.clear()
+
+    @classmethod
+    def load_history(cls, base_path: Path, buffer: 'CascadingBuffer') -> float:
+        """Load historical data from binary logs into a CascadingBuffer.
+
+        Returns the last relative timestamp from loaded data (for continuity).
+        """
+        if not base_path.exists():
+            return 0.0
+
+        start_time = 0.0
+        last_rel_time = 0.0
+
+        # First pass: find start_time from level 0
+        level0_files = list(base_path.glob("level_0_*.bin"))
+        if level0_files:
+            with open(level0_files[0], 'rb') as f:
+                header = f.read(cls.HEADER_SIZE)
+                if len(header) >= cls.HEADER_SIZE:
+                    magic, version, file_level, period, file_start = struct.unpack(
+                        cls.HEADER_FORMAT, header
+                    )
+                    if magic == cls.MAGIC:
+                        start_time = file_start
+
+        if start_time == 0.0:
+            return 0.0
+
+        # Second pass: load data for each level
+        for level in range(len(buffer.levels)):
+            files = list(base_path.glob(f"level_{level}_*.bin"))
+            if not files:
+                continue
+
+            path = files[0]
+            with open(path, 'rb') as f:
+                # Skip header
+                f.seek(cls.HEADER_SIZE)
+
+                # Read records
+                ts = buffer.levels[level]
+                record_size = AggregatedReading.STRUCT_SIZE
+
+                # Seek to load only what fits in buffer
+                file_size = path.stat().st_size
+                num_records = (file_size - cls.HEADER_SIZE) // record_size
+                skip_records = max(0, num_records - ts.max_samples)
+                f.seek(cls.HEADER_SIZE + skip_records * record_size)
+
+                while True:
+                    data = f.read(record_size)
+                    if len(data) < record_size:
+                        break
+                    agg = AggregatedReading.unpack(data)
+                    # Use relative timestamp for buffer
+                    rel_time = agg.timestamp - start_time
+                    ts.timestamps.append(rel_time)
+                    ts.readings.append(agg.to_reading())
+                    if level == 0:
+                        last_rel_time = rel_time
+
+        return last_rel_time
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -636,6 +898,9 @@ class Config:
     log_period: float | None = None
     log_minmax: bool = False
 
+    # Binary persistence
+    db_path: Path | None = None
+
     # Port control
     force: bool = False
 
@@ -648,22 +913,29 @@ class Config:
 # Main Loop
 # =============================================================================
 
+def create_buffer(config: Config) -> CascadingBuffer:
+    """Create a cascading buffer based on config."""
+    levels = [TimeSeries(max_samples=int(config.chart_time / config.period))]
+    history_samples = int(config.history_time / config.avg_period)
+    for _ in range(1, config.num_columns):
+        levels.append(TimeSeries(max_samples=history_samples))
+    return CascadingBuffer(levels=levels, base_period=config.avg_period)
+
+
 def run(
     meter: MeterReader,
     config: Config,
     display: Display,
     sinks: list[DataSink],
+    buffer: CascadingBuffer,
+    time_offset: float = 0.0,
 ) -> None:
-    """Main polling loop."""
-    # Create cascading buffer with num_columns levels
-    # Each cascading level has the same number of samples (visual density)
-    # but covers a 10x longer time window than the previous
-    levels = [TimeSeries(max_samples=int(config.chart_time / config.period))]
-    history_samples = int(config.history_time / config.avg_period)
-    for _ in range(1, config.num_columns):
-        levels.append(TimeSeries(max_samples=history_samples))
-    buffer = CascadingBuffer(levels=levels, base_period=config.avg_period)
+    """Main polling loop.
 
+    Args:
+        buffer: Pre-built cascading buffer (may contain loaded history)
+        time_offset: Offset to add to elapsed time (for history continuity)
+    """
     start_time = time.time()
 
     while True:
@@ -672,7 +944,7 @@ def run(
             time.sleep(config.period)
             continue
 
-        timestamp = time.time() - start_time
+        timestamp = time.time() - start_time + time_offset
         buffer.append(timestamp, reading)
 
         for sink in sinks:
@@ -716,6 +988,8 @@ def parse_args() -> Config:
                         help='Log averaging period (default: same as poll period)')
     parser.add_argument('-M', '--log-minmax', action='store_true',
                         help='Include min/max columns in log (for V, A, W)')
+    parser.add_argument('--db', type=Path, nargs='?', const=Path(__file__).parent / 'data',
+                        metavar='PATH', help='Binary database directory (default: ./data when enabled)')
 
     text_group = parser.add_argument_group('text mode')
     text_group.add_argument('-w', '--watts', type=float, default=1.0,
@@ -781,6 +1055,7 @@ def parse_args() -> Config:
         log_path=args.log,
         log_period=args.log_period,
         log_minmax=args.log_minmax,
+        db_path=args.db,
         force=args.force,
     )
 
@@ -813,8 +1088,27 @@ def main() -> None:
             )
 
     sinks: list[DataSink] = []
+    buffer = create_buffer(config)
+    time_offset = 0.0
+    binary_logger: BinaryLogger | None = None
 
     try:
+        # Set up binary persistence if enabled
+        if config.db_path:
+            binary_logger = BinaryLogger(
+                base_path=config.db_path,
+                base_period=config.avg_period,
+                num_levels=config.num_columns,
+            )
+            # Load history if available
+            if config.db_path.exists():
+                time_offset = BinaryLogger.load_history(config.db_path, buffer)
+                if time_offset > 0:
+                    print(f"# Loaded history: {time_offset:.1f}s", file=sys.stderr)
+            binary_logger.open()
+            sinks.append(binary_logger)
+            print(f"# Binary logging to {config.db_path}/", file=sys.stderr)
+
         log_ctx = open(config.log_path, 'w') if config.log_path else nullcontext()
         with log_ctx as log_file, MeterReader(config.device, force=config.force) as meter:
             if log_file:
@@ -828,7 +1122,7 @@ def main() -> None:
                 minmax_str = ", minmax" if config.log_minmax else ""
                 print(f"# Logging to {config.log_path} (period={config.effective_log_period}s{minmax_str})", file=sys.stderr)
 
-            run(meter, config, display, sinks)
+            run(meter, config, display, sinks, buffer, time_offset)
 
     except KeyboardInterrupt:
         print("\n# Stopped", file=sys.stderr)
