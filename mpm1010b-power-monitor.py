@@ -616,7 +616,7 @@ class Config:
 
     # Display mode
     display_mode: str = 'text'  # 'text', 'graph', 'gui'
-    num_columns: int = 2  # Number of time-scale columns (2-4)
+    num_columns: int = 3  # Number of time-scale columns (2-6)
     chart_time: float = 60.0
     history_time: float = 600.0
     avg_period: float = 1.0
@@ -653,10 +653,12 @@ def run(
 ) -> None:
     """Main polling loop."""
     # Create cascading buffer with num_columns levels
+    # Each cascading level has the same number of samples (visual density)
+    # but covers a 10x longer time window than the previous
     levels = [TimeSeries(max_samples=int(config.chart_time / config.period))]
-    for i in range(1, config.num_columns):
-        period = config.avg_period * (10 ** (i - 1))
-        levels.append(TimeSeries(max_samples=int(config.history_time / period)))
+    history_samples = int(config.history_time / config.avg_period)
+    for _ in range(1, config.num_columns):
+        levels.append(TimeSeries(max_samples=history_samples))
     buffer = CascadingBuffer(levels=levels, base_period=config.avg_period)
 
     start_time = time.time()
@@ -725,8 +727,8 @@ def parse_args() -> Config:
                                help='Terminal graph mode (plotext)')
     display_group.add_argument('--gui', action='store_true',
                                help='Native GUI mode (DearPyGui)')
-    display_group.add_argument('-c', '--columns', type=int, default=2, choices=[2, 3, 4],
-                               help='Number of time-scale columns (default: 2)')
+    display_group.add_argument('-c', '--columns', type=int, default=3, choices=range(2, 7),
+                               metavar='{2-6}', help='Number of time-scale columns (default: 3)')
     display_group.add_argument('-t', '--chart-time', type=float, default=60.0,
                                help='Recent window in seconds (default: 60)')
     display_group.add_argument('-T', '--history-time', type=float, default=600.0,
