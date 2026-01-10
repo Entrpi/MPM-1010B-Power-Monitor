@@ -7,14 +7,17 @@
 MPM-1010B AC Power Meter Monitor
 
 Polls the meter and outputs a line when voltage or power changes significantly.
-Supports live terminal graph mode.
+Supports live terminal graph mode and file logging.
 """
 
 import argparse
 import sys
 import time
 from collections import deque
-from typing import NamedTuple
+from contextlib import nullcontext
+from datetime import datetime
+from pathlib import Path
+from typing import IO, NamedTuple
 
 import serial
 
@@ -61,7 +64,22 @@ def parse_range(s: str) -> tuple[float, float]:
     return float(lo), float(hi)
 
 
-def run_graph_mode(ser: serial.Serial, args: argparse.Namespace) -> None:
+def write_log_header(f: IO[str]) -> None:
+    """Write TSV header to log file."""
+    f.write("# MPM-1010B power log\n")
+    f.write("# started: " + datetime.now().isoformat() + "\n")
+    f.write("timestamp\telapsed_s\tV\tA\tW\tPF\tHz\n")
+    f.flush()
+
+
+def write_log_line(f: IO[str], elapsed: float, r: Reading) -> None:
+    """Write a reading to log file."""
+    ts = datetime.now().isoformat(timespec='milliseconds')
+    f.write(f"{ts}\t{elapsed:.2f}\t{r.voltage:.2f}\t{r.current:.3f}\t{r.power:.2f}\t{r.power_factor:.3f}\t{r.frequency:.2f}\n")
+    f.flush()
+
+
+def run_graph_mode(ser: serial.Serial, args: argparse.Namespace, log_file: IO[str] | None) -> None:
     """Run live graph display with dual timescales."""
     import plotext as plt
 
@@ -94,6 +112,9 @@ def run_graph_mode(ser: serial.Serial, args: argparse.Namespace) -> None:
         recent_t.append(now)
         recent_v.append(reading.voltage)
         recent_w.append(reading.power)
+
+        if log_file:
+            write_log_line(log_file, now, reading)
 
         # Accumulate for averaging
         acc_v.append(reading.voltage)
@@ -150,9 +171,10 @@ def run_graph_mode(ser: serial.Serial, args: argparse.Namespace) -> None:
         time.sleep(args.period)
 
 
-def run_text_mode(ser: serial.Serial, args: argparse.Namespace) -> None:
+def run_text_mode(ser: serial.Serial, args: argparse.Namespace, log_file: IO[str] | None) -> None:
     """Run text output mode."""
     last: Reading | None = None
+    start_time = time.time()
 
     print(f"# Monitoring {args.device} (period={args.period}s, dV={args.volts}V, dP={args.watts}W)")
     print("# timestamp\tV\tA\tW\tPF\tHz")
@@ -162,6 +184,12 @@ def run_text_mode(ser: serial.Serial, args: argparse.Namespace) -> None:
         if (reading := poll_meter(ser)) is None:
             time.sleep(args.period)
             continue
+
+        elapsed = time.time() - start_time
+
+        # Always log if logging enabled
+        if log_file:
+            write_log_line(log_file, elapsed, reading)
 
         changed = (
             args.all
@@ -187,14 +215,16 @@ def main() -> None:
         epilog='Examples:\n'
                '  %(prog)s --graph                        Dual timescale graph (60s detail, 10min history)\n'
                '  %(prog)s -g -t 30 -T 300 -a 2           30s detail, 5min history @ 2s avg\n'
-               '  %(prog)s -g -p 0.1 -a 1                 Fast poll (0.1s), 1s averaging\n'
-               '  %(prog)s --graph --scale-v 220:250      Fixed voltage scale\n'
+               '  %(prog)s -g -l build.tsv                Graph + log to file for later analysis\n'
+               '  %(prog)s -l power.tsv -p 1              Log every 1s to file (no display)\n'
                '  %(prog)s --all                          Text mode, all readings\n'
     )
     parser.add_argument('-d', '--device', default='/dev/cu.PL2303G-USBtoUART3110',
                         help='Serial device path')
     parser.add_argument('-p', '--period', type=float, default=0.2,
                         help='Polling period in seconds (default: 0.2)')
+    parser.add_argument('-l', '--log', type=Path, metavar='FILE',
+                        help='Log all readings to TSV file')
 
     # Text mode options
     text_group = parser.add_argument_group('text mode')
@@ -223,12 +253,18 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        with serial.Serial(args.device, baudrate=9600, bytesize=8,
+        log_ctx = open(args.log, 'w') if args.log else nullcontext()
+        with log_ctx as log_file, \
+             serial.Serial(args.device, baudrate=9600, bytesize=8,
                            parity='N', stopbits=1, timeout=1.0) as ser:
+            if log_file:
+                write_log_header(log_file)
+                print(f"# Logging to {args.log}", file=sys.stderr)
+
             if args.graph:
-                run_graph_mode(ser, args)
+                run_graph_mode(ser, args, log_file)
             else:
-                run_text_mode(ser, args)
+                run_text_mode(ser, args, log_file)
 
     except KeyboardInterrupt:
         print("\n# Stopped", file=sys.stderr)
