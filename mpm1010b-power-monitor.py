@@ -30,6 +30,34 @@ class Reading(NamedTuple):
     frequency: float
 
 
+class LogAccumulator:
+    """Accumulates readings and writes averaged values at fixed intervals."""
+
+    def __init__(self, file: IO[str], period: float):
+        self.file = file
+        self.period = period
+        self.readings: list[Reading] = []
+        self.last_write = 0.0
+
+    def add(self, elapsed: float, reading: Reading) -> None:
+        self.readings.append(reading)
+        if elapsed - self.last_write >= self.period and self.readings:
+            self._flush(elapsed)
+
+    def _flush(self, elapsed: float) -> None:
+        n = len(self.readings)
+        avg = Reading(
+            sum(r.voltage for r in self.readings) / n,
+            sum(r.current for r in self.readings) / n,
+            sum(r.power for r in self.readings) / n,
+            sum(r.power_factor for r in self.readings) / n,
+            sum(r.frequency for r in self.readings) / n,
+        )
+        write_log_line(self.file, elapsed, avg)
+        self.readings.clear()
+        self.last_write = elapsed
+
+
 def decode_4digits(b4: bytes, /) -> float:
     """Decode 4-byte BCD field with decimal point flag in high nibble."""
     digits = [x & 0x0F for x in b4]
@@ -79,7 +107,7 @@ def write_log_line(f: IO[str], elapsed: float, r: Reading) -> None:
     f.flush()
 
 
-def run_graph_mode(ser: serial.Serial, args: argparse.Namespace, log_file: IO[str] | None) -> None:
+def run_graph_mode(ser: serial.Serial, args: argparse.Namespace, logger: LogAccumulator | None) -> None:
     """Run live graph display with dual timescales."""
     import plotext as plt
 
@@ -113,8 +141,8 @@ def run_graph_mode(ser: serial.Serial, args: argparse.Namespace, log_file: IO[st
         recent_v.append(reading.voltage)
         recent_w.append(reading.power)
 
-        if log_file:
-            write_log_line(log_file, now, reading)
+        if logger:
+            logger.add(now, reading)
 
         # Accumulate for averaging
         acc_v.append(reading.voltage)
@@ -171,7 +199,7 @@ def run_graph_mode(ser: serial.Serial, args: argparse.Namespace, log_file: IO[st
         time.sleep(args.period)
 
 
-def run_text_mode(ser: serial.Serial, args: argparse.Namespace, log_file: IO[str] | None) -> None:
+def run_text_mode(ser: serial.Serial, args: argparse.Namespace, logger: LogAccumulator | None) -> None:
     """Run text output mode."""
     last: Reading | None = None
     start_time = time.time()
@@ -187,9 +215,8 @@ def run_text_mode(ser: serial.Serial, args: argparse.Namespace, log_file: IO[str
 
         elapsed = time.time() - start_time
 
-        # Always log if logging enabled
-        if log_file:
-            write_log_line(log_file, elapsed, reading)
+        if logger:
+            logger.add(elapsed, reading)
 
         changed = (
             args.all
@@ -215,8 +242,8 @@ def main() -> None:
         epilog='Examples:\n'
                '  %(prog)s --graph                        Dual timescale graph (60s detail, 10min history)\n'
                '  %(prog)s -g -t 30 -T 300 -a 2           30s detail, 5min history @ 2s avg\n'
-               '  %(prog)s -g -l build.tsv                Graph + log to file for later analysis\n'
-               '  %(prog)s -l power.tsv -p 1              Log every 1s to file (no display)\n'
+               '  %(prog)s -g -l build.tsv                Graph + log to file\n'
+               '  %(prog)s -l build.tsv -p 0.1 -L 1       Poll 0.1s, log 1s averages\n'
                '  %(prog)s --all                          Text mode, all readings\n'
     )
     parser.add_argument('-d', '--device', default='/dev/cu.PL2303G-USBtoUART3110',
@@ -224,7 +251,9 @@ def main() -> None:
     parser.add_argument('-p', '--period', type=float, default=0.2,
                         help='Polling period in seconds (default: 0.2)')
     parser.add_argument('-l', '--log', type=Path, metavar='FILE',
-                        help='Log all readings to TSV file')
+                        help='Log readings to TSV file')
+    parser.add_argument('-L', '--log-period', type=float, default=None, metavar='SEC',
+                        help='Log averaging period (default: same as poll period)')
 
     # Text mode options
     text_group = parser.add_argument_group('text mode')
@@ -257,14 +286,17 @@ def main() -> None:
         with log_ctx as log_file, \
              serial.Serial(args.device, baudrate=9600, bytesize=8,
                            parity='N', stopbits=1, timeout=1.0) as ser:
+            logger = None
             if log_file:
+                log_period = args.log_period if args.log_period else args.period
                 write_log_header(log_file)
-                print(f"# Logging to {args.log}", file=sys.stderr)
+                logger = LogAccumulator(log_file, log_period)
+                print(f"# Logging to {args.log} (period={log_period}s)", file=sys.stderr)
 
             if args.graph:
-                run_graph_mode(ser, args, log_file)
+                run_graph_mode(ser, args, logger)
             else:
-                run_text_mode(ser, args, log_file)
+                run_text_mode(ser, args, logger)
 
     except KeyboardInterrupt:
         print("\n# Stopped", file=sys.stderr)
