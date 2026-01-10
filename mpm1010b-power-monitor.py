@@ -13,9 +13,11 @@ Supports terminal graphs, native GUI, text output, and file logging.
 from __future__ import annotations
 
 import argparse
+import os
+import signal
+import subprocess
 import sys
 import time
-from abc import ABC, abstractmethod
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -128,6 +130,35 @@ def decode_bcd_field(data: bytes, /) -> float:
     return float(value)
 
 
+def kill_port_holder(port: str) -> bool:
+    """Find and kill process holding a serial port. Returns True if killed."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-t", port],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return False
+
+        for pid_str in result.stdout.strip().split('\n'):
+            pid = int(pid_str)
+            if pid == os.getpid():
+                continue
+            print(f"Killing process {pid} holding {port}...", file=sys.stderr)
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.3)
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.2)
+        return True
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return False
+
+
 class MeterReader:
     """Handles serial communication with the MPM-1010B meter."""
 
@@ -136,20 +167,39 @@ class MeterReader:
     START_BYTE = 0x21
     POLL_COMMAND = b'?'
 
-    def __init__(self, port: str, timeout: float = 0.1):
+    def __init__(self, port: str, timeout: float = 0.1, force: bool = False):
         self.port = port
         self.timeout = timeout
+        self.force = force
         self._serial: serial.Serial | None = None
 
     def open(self) -> None:
-        self._serial = serial.Serial(
-            self.port,
-            baudrate=self.BAUD_RATE,
-            bytesize=8,
-            parity='N',
-            stopbits=1,
-            timeout=self.timeout,
-        )
+        try:
+            self._serial = serial.Serial(
+                self.port,
+                baudrate=self.BAUD_RATE,
+                bytesize=8,
+                parity='N',
+                stopbits=1,
+                timeout=self.timeout,
+                exclusive=True,
+            )
+        except serial.SerialException as e:
+            if self.force and ("Resource" in str(e) or "lock" in str(e).lower()):
+                if kill_port_holder(self.port):
+                    self._serial = serial.Serial(
+                        self.port,
+                        baudrate=self.BAUD_RATE,
+                        bytesize=8,
+                        parity='N',
+                        stopbits=1,
+                        timeout=self.timeout,
+                        exclusive=True,
+                    )
+                else:
+                    raise
+            else:
+                raise
 
     def close(self) -> None:
         if self._serial:
@@ -319,6 +369,7 @@ class DearPyGuiDisplay:
     history_time: float = 600.0
     avg_period: float = 1.0
     _initialized: bool = field(default=False, repr=False)
+    _split_ratio: float = field(default=0.5, repr=False)
 
     def _setup(self) -> None:
         """Initialize DearPyGui context and window."""
@@ -327,10 +378,34 @@ class DearPyGuiDisplay:
         dpg.create_context()
         dpg.create_viewport(title='MPM-1010B Power Monitor', width=1200, height=700)
 
-        with dpg.window(label="Power Monitor", tag="main_window"):
+        SPLITTER_WIDTH = 8
+
+        def resize_plots():
+            """Resize plots to fit viewport."""
+            vp_height = dpg.get_viewport_height()
+            vp_width = dpg.get_viewport_width()
+            plot_height = (vp_height - 60) // 2
+            content_height = plot_height * 2 + 8  # Two plots plus spacing
+            usable_width = vp_width - SPLITTER_WIDTH - 16
+            left_width = int(usable_width * self._split_ratio)
+            right_width = usable_width - left_width
+            for tag in ("plot_v_hist", "plot_w_hist", "plot_v_recent", "plot_w_recent"):
+                dpg.set_item_height(tag, plot_height)
+            dpg.set_item_width("left_col", left_width)
+            dpg.set_item_width("right_col", right_width)
+            dpg.set_item_height("splitter", content_height)
+
+        def on_splitter_drag(sender, app_data):
+            mouse_x = dpg.get_mouse_pos(local=False)[0]
+            vp_width = dpg.get_viewport_width()
+            usable_width = vp_width - SPLITTER_WIDTH - 16
+            self._split_ratio = max(0.2, min(0.8, (mouse_x - 8) / usable_width))
+            resize_plots()
+
+        with dpg.window(label="Power Monitor", tag="main_window", no_scrollbar=True):
             with dpg.group(horizontal=True):
                 # History plots (left)
-                with dpg.child_window(width=580, height=-1):
+                with dpg.group(tag="left_col"):
                     with dpg.plot(label="Voltage History", height=300, width=-1, tag="plot_v_hist"):
                         dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="v_hist_x")
                         dpg.add_plot_axis(dpg.mvYAxis, label="V", tag="v_hist_y")
@@ -345,8 +420,14 @@ class DearPyGuiDisplay:
                         if self.scale_w:
                             dpg.set_axis_limits("w_hist_y", self.scale_w[0], self.scale_w[1])
 
+                # Draggable splitter
+                dpg.add_button(label="", width=SPLITTER_WIDTH, height=300, tag="splitter")
+                with dpg.item_handler_registry(tag="splitter_handler"):
+                    dpg.add_item_active_handler(callback=on_splitter_drag)
+                dpg.bind_item_handler_registry("splitter", "splitter_handler")
+
                 # Recent plots (right)
-                with dpg.child_window(width=-1, height=-1):
+                with dpg.group(tag="right_col"):
                     with dpg.plot(label="Voltage", height=300, width=-1, tag="plot_v_recent"):
                         dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="v_recent_x")
                         dpg.add_plot_axis(dpg.mvYAxis, label="V", tag="v_recent_y")
@@ -365,8 +446,10 @@ class DearPyGuiDisplay:
             dpg.add_text("", tag="status_text")
 
         dpg.set_primary_window("main_window", True)
+        dpg.set_viewport_resize_callback(resize_plots)
         dpg.setup_dearpygui()
         dpg.show_viewport()
+        resize_plots()  # Initial sizing
         self._initialized = True
 
     def update(self, timestamp: float, reading: Reading, buffer: DualResolutionBuffer) -> None:
@@ -506,6 +589,9 @@ class Config:
     log_period: float | None = None
     log_minmax: bool = False
 
+    # Port control
+    force: bool = False
+
     @property
     def effective_log_period(self) -> float:
         return self.log_period if self.log_period is not None else self.period
@@ -570,6 +656,8 @@ def parse_args() -> Config:
     )
     parser.add_argument('-d', '--device', default='/dev/cu.PL2303G-USBtoUART3110',
                         help='Serial device path')
+    parser.add_argument('-f', '--force', action='store_true',
+                        help='Kill other processes using the serial port')
     parser.add_argument('-p', '--period', type=float, default=0.04,
                         help='Polling period in seconds (default: 0.04 = 25Hz)')
     parser.add_argument('-l', '--log', type=Path, metavar='FILE',
@@ -628,6 +716,7 @@ def parse_args() -> Config:
         log_path=args.log,
         log_period=args.log_period,
         log_minmax=args.log_minmax,
+        force=args.force,
     )
 
 
@@ -662,7 +751,7 @@ def main() -> None:
 
     try:
         log_ctx = open(config.log_path, 'w') if config.log_path else nullcontext()
-        with log_ctx as log_file, MeterReader(config.device) as meter:
+        with log_ctx as log_file, MeterReader(config.device, force=config.force) as meter:
             if log_file:
                 logger = FileLogger(
                     file=log_file,
