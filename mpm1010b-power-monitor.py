@@ -409,9 +409,11 @@ class TerminalGraphDisplay:
     poll_period: float = 0.04
     metrics: list[str] = field(default_factory=lambda: DEFAULT_METRICS.copy())
     avg_period: float = 1.0
+    start_time: float = 0.0  # Session start time for wallclock display
 
     def update(self, timestamp: float, reading: Reading, buffer: CascadingBuffer) -> None:
         import plotext as plt
+        from datetime import datetime
 
         n = min(self.num_columns, len(buffer.levels))
         num_metrics = len(self.metrics)
@@ -422,7 +424,8 @@ class TerminalGraphDisplay:
         for col in range(n):
             level_idx = n - 1 - col  # Reverse: col 0 gets highest level
             level = buffer.levels[level_idx]
-            t = list(level.timestamps) if level.timestamps else []
+            # Convert relative timestamps to wallclock datetime strings
+            t = [datetime.fromtimestamp(self.start_time + ts) for ts in level.timestamps] if level.timestamps else []
 
             # Column label
             if level_idx == 0:
@@ -453,7 +456,7 @@ class TerminalGraphDisplay:
 
                 plt.ylabel(unit if unit else metric)
                 if row == num_metrics - 1:
-                    plt.xlabel('Time (s)')
+                    plt.xlabel('Time')
 
         plt.show()
 
@@ -500,6 +503,7 @@ class DearPyGuiDisplay:
     poll_period: float = 0.04
     metrics: list[str] = field(default_factory=lambda: DEFAULT_METRICS.copy())
     avg_period: float = 1.0
+    start_time: float = 0.0  # Session start time for wallclock display
     _initialized: bool = field(default=False, repr=False)
     _col_widths: list[float] = field(default_factory=list, repr=False)
 
@@ -577,7 +581,7 @@ class DearPyGuiDisplay:
                             ylabel = unit if unit else metric
 
                             with dpg.plot(label=f"{name} - {time_label}", height=300, width=-1, tag=f"plot_{metric}_{col}"):
-                                dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag=f"{metric}_x_{col}")
+                                dpg.add_plot_axis(dpg.mvXAxis, label="Time", time=True, tag=f"{metric}_x_{col}")
                                 dpg.add_plot_axis(dpg.mvYAxis, label=ylabel, tag=f"{metric}_y_{col}")
                                 dpg.add_line_series([], [], label=metric, parent=f"{metric}_y_{col}", tag=f"series_{metric}_{col}")
 
@@ -605,6 +609,10 @@ class DearPyGuiDisplay:
         if not dpg.is_dearpygui_running():
             raise KeyboardInterrupt
 
+        # DearPyGui time axis uses UTC, so add local timezone offset
+        local_offset = time.timezone if time.daylight == 0 else time.altzone
+        tz_adjust = -local_offset  # Convert to seconds ahead of UTC
+
         n = min(self.num_columns, len(buffer.levels))
         for col in range(n):
             level_idx = n - 1 - col
@@ -612,7 +620,8 @@ class DearPyGuiDisplay:
             if not level.timestamps:
                 continue
 
-            t = list(level.timestamps)
+            # Convert relative timestamps to absolute (Unix time) + timezone adjustment
+            t = [self.start_time + ts + tz_adjust for ts in level.timestamps]
 
             for metric in self.metrics:
                 _, _, attr, _ = METRICS[metric]
@@ -1111,6 +1120,12 @@ def main() -> None:
             binary_logger.open()
             sinks.append(binary_logger)
             print(f"# Binary logging to {config.db_path}/", file=sys.stderr)
+
+        # Set start_time for wallclock display (use current time if no history)
+        if start_time is None:
+            start_time = time.time()
+        if hasattr(display, 'start_time'):
+            display.start_time = start_time
 
         log_ctx = open(config.log_path, 'w') if config.log_path else nullcontext()
         with log_ctx as log_file, MeterReader(config.device, force=config.force) as meter:
