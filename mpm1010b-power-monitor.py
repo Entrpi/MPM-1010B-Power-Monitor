@@ -534,12 +534,21 @@ class DearPyGuiDisplay:
             plot_height = (vp_height - 60) // num_metrics
             content_height = plot_height * num_metrics + 8
             num_splitters = n - 1
-            usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - 16
+            # Account for: splitter widths, item spacing (8px between each element), and window padding
+            item_spacing = 8 * (2 * n - 2)  # gaps between n columns and n-1 splitters
+            usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - item_spacing - 17
 
+            total_used = 0
             for col in range(n):
-                col_width = int(usable_width * self._col_widths[col])
+                if col == n - 1:
+                    # Last column gets remaining width to avoid overflow
+                    col_width = usable_width - total_used
+                else:
+                    col_width = int(usable_width * self._col_widths[col])
+                    total_used += col_width
                 dpg.set_item_width(f"col_{col}", col_width)
-                for row, metric in enumerate(self.metrics):
+                for metric in self.metrics:
+                    dpg.set_item_width(f"plot_{metric}_{col}", col_width)
                     dpg.set_item_height(f"plot_{metric}_{col}", plot_height)
 
             for i in range(num_splitters):
@@ -550,7 +559,8 @@ class DearPyGuiDisplay:
                 mouse_x = dpg.get_mouse_pos(local=False)[0]
                 vp_width = dpg.get_viewport_width()
                 num_splitters = n - 1
-                usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - 16
+                item_spacing = 8 * (2 * n - 2)
+                usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - item_spacing - 17
 
                 cumulative = sum(self._col_widths[:idx]) * usable_width + 8
                 for i in range(idx):
@@ -567,7 +577,7 @@ class DearPyGuiDisplay:
                 resize_plots()
             return on_drag
 
-        with dpg.window(label="Power Monitor", tag="main_window", no_scrollbar=True):
+        with dpg.window(label="Power Monitor", tag="main_window", no_scrollbar=True, horizontal_scrollbar=False):
             with dpg.group(horizontal=True):
                 for col in range(n):
                     level_idx = n - 1 - col
@@ -585,7 +595,7 @@ class DearPyGuiDisplay:
                             name, unit, attr, _ = METRICS[metric]
                             ylabel = unit if unit else metric
 
-                            with dpg.plot(label=f"{name} - {time_label}", height=300, width=-1, tag=f"plot_{metric}_{col}"):
+                            with dpg.plot(label=f"{name} - {time_label}", height=300, tag=f"plot_{metric}_{col}"):
                                 dpg.add_plot_axis(dpg.mvXAxis, label="Time", time=True, tag=f"{metric}_x_{col}")
                                 dpg.add_plot_axis(dpg.mvYAxis, label=ylabel, tag=f"{metric}_y_{col}")
                                 dpg.add_line_series([], [], label=metric, parent=f"{metric}_y_{col}", tag=f"series_{metric}_{col}")
