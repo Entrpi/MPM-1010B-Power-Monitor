@@ -809,13 +809,13 @@ class BinaryLogger:
     def load_history(cls, base_path: Path, buffer: 'CascadingBuffer') -> float:
         """Load historical data from binary logs into a CascadingBuffer.
 
-        Returns the last relative timestamp from loaded data (for continuity).
+        Returns the original start_time (absolute) so new data can maintain
+        the same time reference, preserving gaps.
         """
         if not base_path.exists():
             return 0.0
 
         start_time = 0.0
-        last_rel_time = 0.0
 
         # First pass: find start_time from level 0
         level0_files = list(base_path.glob("level_0_*.bin"))
@@ -862,10 +862,8 @@ class BinaryLogger:
                     rel_time = agg.timestamp - start_time
                     ts.timestamps.append(rel_time)
                     ts.readings.append(agg.to_reading())
-                    if level == 0:
-                        last_rel_time = rel_time
 
-        return last_rel_time
+        return start_time
 
 
 # =============================================================================
@@ -928,15 +926,17 @@ def run(
     display: Display,
     sinks: list[DataSink],
     buffer: CascadingBuffer,
-    time_offset: float = 0.0,
+    start_time: float | None = None,
 ) -> None:
     """Main polling loop.
 
     Args:
         buffer: Pre-built cascading buffer (may contain loaded history)
-        time_offset: Offset to add to elapsed time (for history continuity)
+        start_time: Original session start time (absolute). If None, uses current time.
+                    Using the same start_time across restarts preserves time gaps.
     """
-    start_time = time.time()
+    if start_time is None:
+        start_time = time.time()
 
     while True:
         reading = meter.poll()
@@ -944,7 +944,7 @@ def run(
             time.sleep(config.period)
             continue
 
-        timestamp = time.time() - start_time + time_offset
+        timestamp = time.time() - start_time
         buffer.append(timestamp, reading)
 
         for sink in sinks:
@@ -1089,7 +1089,7 @@ def main() -> None:
 
     sinks: list[DataSink] = []
     buffer = create_buffer(config)
-    time_offset = 0.0
+    start_time: float | None = None
     binary_logger: BinaryLogger | None = None
 
     try:
@@ -1102,9 +1102,12 @@ def main() -> None:
             )
             # Load history if available
             if config.db_path.exists():
-                time_offset = BinaryLogger.load_history(config.db_path, buffer)
-                if time_offset > 0:
-                    print(f"# Loaded history: {time_offset:.1f}s", file=sys.stderr)
+                start_time = BinaryLogger.load_history(config.db_path, buffer)
+                if start_time > 0:
+                    elapsed = time.time() - start_time
+                    print(f"# Loaded history from {elapsed:.0f}s ago", file=sys.stderr)
+                else:
+                    start_time = None
             binary_logger.open()
             sinks.append(binary_logger)
             print(f"# Binary logging to {config.db_path}/", file=sys.stderr)
@@ -1122,7 +1125,7 @@ def main() -> None:
                 minmax_str = ", minmax" if config.log_minmax else ""
                 print(f"# Logging to {config.log_path} (period={config.effective_log_period}s{minmax_str})", file=sys.stderr)
 
-            run(meter, config, display, sinks, buffer, time_offset)
+            run(meter, config, display, sinks, buffer, start_time)
 
     except KeyboardInterrupt:
         print("\n# Stopped", file=sys.stderr)
