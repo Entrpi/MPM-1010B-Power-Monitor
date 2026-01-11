@@ -878,7 +878,24 @@ class DearPyGuiDisplay:
 
                 if metric in visible_metrics:
                     dpg.fit_axis_data(f"{metric}_x_{col}")
-                    dpg.fit_axis_data(f"{metric}_y_{col}")
+                    # Fit Y axis with 3px padding so edge points are visible
+                    y_axis = f"{metric}_y_{col}"
+                    if values:
+                        y_min, y_max = min(values), max(values)
+                        # Include min/max series if visible
+                        if show_minmax and level_idx > 0 and level.min_readings and level.max_readings:
+                            y_min = min(y_min, min(min_values))
+                            y_max = max(y_max, max(max_values))
+                        y_range = y_max - y_min
+                        plot_h = dpg.get_item_height(f"plot_{metric}_{col}")
+                        if y_range > 0 and plot_h > 0:
+                            padding = (3 / plot_h) * y_range
+                            dpg.set_axis_limits(y_axis, y_min - padding, y_max + padding)
+                        elif y_range == 0:
+                            # All same value - add small fixed padding
+                            dpg.set_axis_limits(y_axis, y_min - 0.1, y_max + 0.1)
+                    else:
+                        dpg.fit_axis_data(y_axis)
 
         # Hover tooltip - check each visible plot for mouse hover
         tooltip_shown = False
@@ -911,22 +928,31 @@ class DearPyGuiDisplay:
                 if not t_list or len(t_list) < 2:
                     continue
 
-                # Get axis limits to properly map screen position to time
-                x_axis_tag = f"{metric}_x_{col}"
-                x_limits = dpg.get_axis_limits(x_axis_tag)
-                if x_limits[1] <= x_limits[0]:
+                # Use actual data bounds (axis is fitted to these)
+                data_start = t_list[0]
+                data_end = t_list[-1]
+                data_range = data_end - data_start
+                if data_range <= 0:
                     continue
 
-                # Account for plot margins (Y-axis labels on left, small margin on right)
+                # Account for plot margins (title on top, axis labels on sides/bottom)
                 left_margin = 63
                 right_margin = 10
+                top_margin = 25
+                bottom_margin = 20
                 plot_area_left = plot_pos[0] + left_margin
+                plot_area_top = plot_pos[1] + top_margin
                 plot_area_width = plot_width - left_margin - right_margin
+                plot_area_height = plot_height - top_margin - bottom_margin
 
-                # Map screen position to time using axis limits
+                # Only show tooltip when mouse is in the actual data area
+                if not (plot_area_left <= mouse_screen[0] <= plot_area_left + plot_area_width and
+                        plot_area_top <= mouse_screen[1] <= plot_area_top + plot_area_height):
+                    continue
+
+                # Map screen position to time using data bounds
                 norm_x = (mouse_screen[0] - plot_area_left) / plot_area_width
-                norm_x = max(0, min(1, norm_x))
-                mouse_time = x_limits[0] + norm_x * (x_limits[1] - x_limits[0])
+                mouse_time = data_start + norm_x * data_range
 
                 # Find nearest timestamp in actual data
                 idx = min(range(len(t_list)), key=lambda i: abs(t_list[i] - mouse_time))
@@ -941,11 +967,25 @@ class DearPyGuiDisplay:
 
                 # Format tooltip with timestamp
                 if level_idx > 0 and level.min_readings and level.max_readings:
+                    # Aggregated data already has min/max
                     min_val = getattr(level.min_readings[idx], attr)
                     max_val = getattr(level.max_readings[idx], attr)
                     tooltip = f"{ts_str}  {metric}: {val:.3f}{unit}  Min: {min_val:.3f}{unit}  Max: {max_val:.3f}{unit}"
                 else:
-                    tooltip = f"{ts_str}  {metric}: {val:.3f}{unit}"
+                    # Realtime data: show min/max of nearby samples to catch transients
+                    window = 10  # samples on each side
+                    start_idx = max(0, idx - window)
+                    end_idx = min(len(level.readings), idx + window + 1)
+                    nearby = [getattr(level.readings[i], attr) for i in range(start_idx, end_idx)]
+                    if len(nearby) > 1:
+                        min_val = min(nearby)
+                        max_val = max(nearby)
+                        if min_val != max_val:
+                            tooltip = f"{ts_str}  {metric}: {val:.3f}{unit}  (±{window}: {min_val:.3f}-{max_val:.3f}{unit})"
+                        else:
+                            tooltip = f"{ts_str}  {metric}: {val:.3f}{unit}"
+                    else:
+                        tooltip = f"{ts_str}  {metric}: {val:.3f}{unit}"
 
                 dpg.set_value("tooltip_text", tooltip)
                 # Position at bottom-right, inside plot margins
