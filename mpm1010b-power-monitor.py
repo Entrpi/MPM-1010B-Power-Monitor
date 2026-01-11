@@ -805,7 +805,7 @@ class DearPyGuiDisplay:
             # Tooltip window for hover info
             with dpg.window(tag="hover_tooltip", no_title_bar=True, no_move=True,
                            no_resize=True, no_scrollbar=True, show=False,
-                           no_focus_on_appearing=True, min_size=[10, 10]):
+                           no_focus_on_appearing=True, min_size=[380, 10], autosize=True):
                 dpg.add_text("", tag="tooltip_text")
 
         dpg.set_primary_window("main_window", True)
