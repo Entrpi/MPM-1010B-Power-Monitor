@@ -555,7 +555,9 @@ class DearPyGuiDisplay:
     avg_period: float = 1.0
     start_time: float = 0.0  # Session start time for wallclock display
     _initialized: bool = field(default=False, repr=False)
-    _col_widths: list[float] = field(default_factory=list, repr=False)
+    _col_widths: dict[int, list[float]] = field(default_factory=dict, repr=False)  # Widths per column count
+    _resize_plots: object = field(default=None, repr=False)  # Store resize callback
+    _last_n_cols: int = field(default=0, repr=False)
 
     def _setup(self) -> None:
         """Initialize DearPyGui context and window."""
@@ -565,67 +567,144 @@ class DearPyGuiDisplay:
         dpg.create_viewport(title='MPM-1010B Power Monitor', width=1200, height=700)
 
         SPLITTER_WIDTH = 8
-        n = self.num_columns
-        num_metrics = len(self.metrics)
+        MAX_COLS = 6  # Max cascade levels
 
-        # Initialize equal column widths
-        if not self._col_widths:
-            self._col_widths = [1.0 / n] * n
+        # Track current column count for detecting changes
+        self._last_n_cols = self.num_columns
+
+        def get_widths_for_n(n: int) -> list[float]:
+            """Get or create widths for n columns, carrying over proportions from other layouts.
+
+            Columns are ordered left-to-right as: highest avg ... 1s avg, realtime
+            When reducing columns, we remove from the LEFT (highest cascade levels).
+            When adding columns, we add to the LEFT.
+            """
+            if n in self._col_widths:
+                return self._col_widths[n]
+
+            # Check if we have widths from a different column count to inherit from
+            if self._last_n_cols > 0 and self._last_n_cols in self._col_widths:
+                old_widths = self._col_widths[self._last_n_cols]
+                old_n = self._last_n_cols
+
+                if n < old_n:
+                    # Reducing columns: take LAST n widths (rightmost columns stay)
+                    # This preserves realtime, 1s avg, etc. identity
+                    new_widths = old_widths[old_n - n:]
+                    total = sum(new_widths)
+                    new_widths = [w / total for w in new_widths]
+                else:
+                    # Adding columns: add new columns on the LEFT with average width
+                    avg_width = 1.0 / n
+                    new_widths = [avg_width] * (n - old_n) + old_widths[:]
+                    total = sum(new_widths)
+                    new_widths = [w / total for w in new_widths]
+
+                self._col_widths[n] = new_widths
+            else:
+                # No prior layout, use equal widths
+                self._col_widths[n] = [1.0 / n] * n
+
+            return self._col_widths[n]
+
+        def get_visible_metrics():
+            """Get list of currently visible metrics."""
+            return [m for m in ALL_METRICS if dpg.get_value(f"show_{m}")]
+
+        def get_visible_columns():
+            """Get number of visible columns."""
+            return int(dpg.get_value("column_slider"))
 
         def resize_plots():
-            """Resize plots to fit viewport."""
+            """Resize plots to fit viewport based on visible metrics/columns."""
+            visible_metrics = get_visible_metrics()
+            n = get_visible_columns()
+
+            if not visible_metrics:
+                return
+
             vp_height = dpg.get_viewport_height()
             vp_width = dpg.get_viewport_width()
-            plot_height = (vp_height - 60) // num_metrics
-            content_height = plot_height * num_metrics + 8
+            plot_height = (vp_height - 60) // len(visible_metrics)
+            content_height = plot_height * len(visible_metrics) + 8
             num_splitters = n - 1
-            # Account for: splitter widths, item spacing (8px between each element), and window padding
-            item_spacing = 8 * (2 * n - 2)  # gaps between n columns and n-1 splitters
+            item_spacing = 8 * (2 * n - 2)
             usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - item_spacing - 17
 
+            # Show/hide columns and splitters
+            for col in range(MAX_COLS):
+                visible = col < n
+                dpg.configure_item(f"col_{col}", show=visible)
+                if col < MAX_COLS - 1:
+                    dpg.configure_item(f"splitter_{col}", show=visible and col < n - 1)
+
+            # Show/hide metric plots within visible columns
+            for col in range(n):
+                for metric in ALL_METRICS:
+                    visible = metric in visible_metrics
+                    dpg.configure_item(f"plot_{metric}_{col}", show=visible)
+
+            # Get widths for current column count (creates/inherits if needed)
+            widths = get_widths_for_n(n)
+            self._last_n_cols = n
+
+            # Resize visible columns
             total_used = 0
             for col in range(n):
                 if col == n - 1:
-                    # Last column gets remaining width to avoid overflow
-                    col_width = usable_width - total_used
+                    w = usable_width - total_used  # Last column gets remainder
                 else:
-                    col_width = int(usable_width * self._col_widths[col])
-                    total_used += col_width
-                dpg.set_item_width(f"col_{col}", col_width)
-                for metric in self.metrics:
-                    dpg.set_item_width(f"plot_{metric}_{col}", col_width)
+                    w = int(usable_width * widths[col])
+                    total_used += w
+                dpg.set_item_width(f"col_{col}", w)
+                for metric in visible_metrics:
+                    dpg.set_item_width(f"plot_{metric}_{col}", w)
                     dpg.set_item_height(f"plot_{metric}_{col}", plot_height)
 
             for i in range(num_splitters):
                 dpg.set_item_height(f"splitter_{i}", content_height)
 
+        self._resize_plots = resize_plots
+
+        def on_visibility_change(sender, app_data):
+            resize_plots()
+
         def make_splitter_drag(idx):
             def on_drag(sender, app_data):
+                n = get_visible_columns()
+                if idx >= n - 1:
+                    return
                 mouse_x = dpg.get_mouse_pos(local=False)[0]
                 vp_width = dpg.get_viewport_width()
                 num_splitters = n - 1
                 item_spacing = 8 * (2 * n - 2)
                 usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - item_spacing - 17
 
-                cumulative = sum(self._col_widths[:idx]) * usable_width + 8
+                # Get current widths for this column count
+                widths = get_widths_for_n(n)
+
+                # Calculate cumulative position up to this splitter
+                cumulative = sum(widths[:idx]) * usable_width + 8
                 for i in range(idx):
                     cumulative += SPLITTER_WIDTH
 
+                # Calculate new width ratio for column idx
                 new_width = max(50, mouse_x - cumulative)
                 new_ratio = new_width / usable_width
 
-                old_ratio = self._col_widths[idx]
-                delta = new_ratio - old_ratio
-                if self._col_widths[idx + 1] - delta > 0.1:
-                    self._col_widths[idx] = new_ratio
-                    self._col_widths[idx + 1] -= delta
+                # Apply the change to stored widths
+                delta = new_ratio - widths[idx]
+                if widths[idx + 1] - delta > 0.1:
+                    self._col_widths[n][idx] = new_ratio
+                    self._col_widths[n][idx + 1] = widths[idx + 1] - delta
                 resize_plots()
             return on_drag
 
         with dpg.window(label="Power Monitor", tag="main_window", no_scrollbar=True, horizontal_scrollbar=False):
-            with dpg.group(horizontal=True):
-                for col in range(n):
-                    level_idx = n - 1 - col
+            with dpg.group(horizontal=True, tag="plots_container"):
+                for col in range(MAX_COLS):
+                    # Compute level_idx for max columns, will be adjusted at runtime
+                    level_idx = MAX_COLS - 1 - col
 
                     # Column time label
                     if level_idx == 0:
@@ -635,12 +714,13 @@ class DearPyGuiDisplay:
                         period = self.avg_period * (10 ** (level_idx - 1))
                         time_label = f"{period:.0f}s avg" if period >= 1 else f"{period*1000:.0f}ms avg"
 
-                    with dpg.group(tag=f"col_{col}"):
-                        for metric in self.metrics:
+                    with dpg.group(tag=f"col_{col}", show=(col < self.num_columns)):
+                        for metric in ALL_METRICS:
                             name, unit, attr, color = METRICS[metric]
                             ylabel = unit if unit else metric
+                            visible = metric in self.metrics
 
-                            with dpg.plot(label=f"{name} - {time_label}", height=300, tag=f"plot_{metric}_{col}"):
+                            with dpg.plot(label=f"{name} - {time_label}", height=300, tag=f"plot_{metric}_{col}", show=visible):
                                 dpg.add_plot_axis(dpg.mvXAxis, label="Time", scale=dpg.mvPlotScale_Time, tag=f"{metric}_x_{col}")
                                 dpg.add_plot_axis(dpg.mvYAxis, label=ylabel, tag=f"{metric}_y_{col}")
                                 dpg.add_line_series([], [], label=metric, parent=f"{metric}_y_{col}", tag=f"series_{metric}_{col}")
@@ -660,19 +740,34 @@ class DearPyGuiDisplay:
                                     dpg.bind_item_theme(f"series_{metric}_{col}_min", min_theme)
                                     dpg.bind_item_theme(f"series_{metric}_{col}_max", max_theme)
 
-                    if col < n - 1:
-                        dpg.add_button(label="", width=SPLITTER_WIDTH, height=300, tag=f"splitter_{col}")
+                    if col < MAX_COLS - 1:
+                        show_splitter = col < self.num_columns - 1
+                        dpg.add_button(label="", width=SPLITTER_WIDTH, height=300, tag=f"splitter_{col}", show=show_splitter)
                         with dpg.item_handler_registry(tag=f"splitter_handler_{col}"):
                             dpg.add_item_active_handler(callback=make_splitter_drag(col))
                         dpg.bind_item_handler_registry(f"splitter_{col}", f"splitter_handler_{col}")
 
+            # Control bar - single row
             with dpg.group(horizontal=True):
                 dpg.add_text("", tag="status_text")
-                dpg.add_spacer(width=-1)  # Push checkbox to right
-                dpg.add_checkbox(label="Show", tag="show_minmax", default_value=False)
-                dpg.add_text("Min", color=(255, 165, 0))  # Orange
+                dpg.add_spacer(width=20)
+
+                # Metric toggles
+                for metric in ALL_METRICS:
+                    dpg.add_checkbox(label=metric, tag=f"show_{metric}",
+                                   default_value=(metric in self.metrics),
+                                   callback=on_visibility_change)
+
+                dpg.add_spacer(width=15)
+                dpg.add_slider_int(tag="column_slider", default_value=self.num_columns,
+                                  min_value=2, max_value=6, width=80, format="%d cols",
+                                  callback=on_visibility_change)
+
+                dpg.add_spacer(width=15)
+                dpg.add_checkbox(label="", tag="show_minmax", default_value=False)
+                dpg.add_text("Min", color=(255, 165, 0))
                 dpg.add_text("/", color=(180, 180, 180))
-                dpg.add_text("Max", color=(0, 255, 0))  # Green
+                dpg.add_text("Max", color=(0, 255, 0))
 
         dpg.set_primary_window("main_window", True)
         dpg.set_viewport_resize_callback(resize_plots)
@@ -694,37 +789,53 @@ class DearPyGuiDisplay:
         local_offset = time.timezone if time.daylight == 0 else time.altzone
         tz_adjust = -local_offset  # Convert to seconds ahead of UTC
 
-        n = min(self.num_columns, len(buffer.levels))
-        for col in range(n):
+        # Get current visibility settings
+        n = int(dpg.get_value("column_slider"))
+        visible_metrics = [m for m in ALL_METRICS if dpg.get_value(f"show_{m}")]
+        show_minmax = dpg.get_value("show_minmax")
+
+        # Update plot labels and data for visible columns
+        for col in range(min(n, len(buffer.levels))):
             level_idx = n - 1 - col
-            level = buffer.levels[level_idx]
-            if not level.timestamps:
+            if level_idx >= len(buffer.levels):
                 continue
 
-            # Convert relative timestamps to absolute (Unix time) + timezone adjustment
-            t = [self.start_time + ts + tz_adjust for ts in level.timestamps]
+            # Update plot labels based on current column count
+            if level_idx == 0:
+                hz = 1.0 / self.poll_period
+                time_label = f"{hz:.0f}Hz"
+            else:
+                period = self.avg_period * (10 ** (level_idx - 1))
+                time_label = f"{period:.0f}s avg" if period >= 1 else f"{period*1000:.0f}ms avg"
 
-            for metric in self.metrics:
-                _, _, attr, _ = METRICS[metric]
+            level = buffer.levels[level_idx]
+
+            for metric in ALL_METRICS:
+                name, _, attr, _ = METRICS[metric]
+                # Update label
+                dpg.configure_item(f"plot_{metric}_{col}", label=f"{name} - {time_label}")
+
+                if not level.timestamps:
+                    continue
+
+                t = [self.start_time + ts + tz_adjust for ts in level.timestamps]
                 values = [getattr(r, attr) for r in level.readings]
-
                 dpg.set_value(f"series_{metric}_{col}", [t, values])
 
                 # Update min/max series for aggregated levels
                 if level_idx > 0 and level.min_readings and level.max_readings:
-                    show_minmax = dpg.get_value("show_minmax")
                     if show_minmax:
                         min_values = [getattr(r, attr) for r in level.min_readings]
                         max_values = [getattr(r, attr) for r in level.max_readings]
                         dpg.set_value(f"series_{metric}_{col}_min", [t, min_values])
                         dpg.set_value(f"series_{metric}_{col}_max", [t, max_values])
                     else:
-                        # Clear min/max series when disabled
                         dpg.set_value(f"series_{metric}_{col}_min", [[], []])
                         dpg.set_value(f"series_{metric}_{col}_max", [[], []])
 
-                dpg.fit_axis_data(f"{metric}_x_{col}")
-                dpg.fit_axis_data(f"{metric}_y_{col}")
+                if metric in visible_metrics:
+                    dpg.fit_axis_data(f"{metric}_x_{col}")
+                    dpg.fit_axis_data(f"{metric}_y_{col}")
 
         # Status bar with all metrics
         status_parts = [
@@ -1076,11 +1187,14 @@ class Config:
 # Main Loop
 # =============================================================================
 
+MAX_CASCADE_LEVELS = 6  # Always create 6 levels for dynamic column switching
+
+
 def create_buffer(config: Config) -> CascadingBuffer:
-    """Create a cascading buffer based on config."""
+    """Create a cascading buffer with max levels for dynamic column switching."""
     levels = [TimeSeries(max_samples=int(config.chart_time / config.period))]
     history_samples = int(config.history_time / config.avg_period)
-    for _ in range(1, config.num_columns):
+    for _ in range(1, MAX_CASCADE_LEVELS):
         ts = TimeSeries(max_samples=history_samples)
         ts.enable_minmax()
         levels.append(ts)
@@ -1279,7 +1393,7 @@ def main() -> None:
             binary_logger = BinaryLogger(
                 base_path=config.db_path,
                 base_period=config.avg_period,
-                num_levels=config.num_columns,
+                num_levels=MAX_CASCADE_LEVELS,
             )
             # Load history if available
             if config.db_path.exists():
