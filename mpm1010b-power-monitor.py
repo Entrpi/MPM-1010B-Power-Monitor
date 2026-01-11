@@ -745,7 +745,7 @@ class DearPyGuiDisplay:
                             ylabel = unit if unit else metric
                             visible = metric in self.metrics
 
-                            with dpg.plot(label=f"{name} - {time_label}", height=300, tag=f"plot_{metric}_{col}", show=visible):
+                            with dpg.plot(label=f"{name} - {time_label}", height=300, tag=f"plot_{metric}_{col}", show=visible, no_mouse_pos=True):
                                 dpg.add_plot_axis(dpg.mvXAxis, label="Time", scale=dpg.mvPlotScale_Time, tag=f"{metric}_x_{col}")
                                 dpg.add_plot_axis(dpg.mvYAxis, label=ylabel, tag=f"{metric}_y_{col}")
                                 dpg.add_line_series([], [], label=metric, parent=f"{metric}_y_{col}", tag=f"series_{metric}_{col}")
@@ -801,6 +801,12 @@ class DearPyGuiDisplay:
                 dpg.add_text("Min", color=(255, 165, 0))
                 dpg.add_text("/", color=(180, 180, 180))
                 dpg.add_text("Max", color=(0, 255, 0))
+
+            # Tooltip window for hover info
+            with dpg.window(tag="hover_tooltip", no_title_bar=True, no_move=True,
+                           no_resize=True, no_scrollbar=True, show=False,
+                           no_focus_on_appearing=True, min_size=[10, 10]):
+                dpg.add_text("", tag="tooltip_text")
 
         dpg.set_primary_window("main_window", True)
         dpg.set_viewport_resize_callback(resize_plots)
@@ -873,6 +879,84 @@ class DearPyGuiDisplay:
                 if metric in visible_metrics:
                     dpg.fit_axis_data(f"{metric}_x_{col}")
                     dpg.fit_axis_data(f"{metric}_y_{col}")
+
+        # Hover tooltip - check each visible plot for mouse hover
+        tooltip_shown = False
+        mouse_screen = dpg.get_mouse_pos(local=False)
+
+        for col in range(skip_left, total):
+            if tooltip_shown:
+                break
+            level_idx = MAX_COLS - 1 - col
+            if level_idx >= len(buffer.levels) or level_idx < 0:
+                continue
+            level = buffer.levels[level_idx]
+            if not level.timestamps:
+                continue
+
+            for metric in visible_metrics:
+                plot_tag = f"plot_{metric}_{col}"
+
+                # Check if mouse is within plot bounds
+                plot_pos = dpg.get_item_pos(plot_tag)
+                plot_width = dpg.get_item_width(plot_tag)
+                plot_height = dpg.get_item_height(plot_tag)
+
+                if not (plot_pos[0] <= mouse_screen[0] <= plot_pos[0] + plot_width and
+                        plot_pos[1] <= mouse_screen[1] <= plot_pos[1] + plot_height):
+                    continue
+
+                # Build timestamp list
+                t_list = [self.start_time + ts + tz_adjust for ts in level.timestamps]
+                if not t_list or len(t_list) < 2:
+                    continue
+
+                # Get axis limits to properly map screen position to time
+                x_axis_tag = f"{metric}_x_{col}"
+                x_limits = dpg.get_axis_limits(x_axis_tag)
+                if x_limits[1] <= x_limits[0]:
+                    continue
+
+                # Account for plot margins (Y-axis labels on left, small margin on right)
+                left_margin = 63
+                right_margin = 10
+                plot_area_left = plot_pos[0] + left_margin
+                plot_area_width = plot_width - left_margin - right_margin
+
+                # Map screen position to time using axis limits
+                norm_x = (mouse_screen[0] - plot_area_left) / plot_area_width
+                norm_x = max(0, min(1, norm_x))
+                mouse_time = x_limits[0] + norm_x * (x_limits[1] - x_limits[0])
+
+                # Find nearest timestamp in actual data
+                idx = min(range(len(t_list)), key=lambda i: abs(t_list[i] - mouse_time))
+                reading = level.readings[idx]
+                _, unit, attr, _ = METRICS[metric]
+                val = getattr(reading, attr)
+
+                # Format timestamp (convert back from plot time to local time)
+                from datetime import datetime
+                actual_time = self.start_time + level.timestamps[idx]
+                ts_str = datetime.fromtimestamp(actual_time).strftime("%H:%M:%S")
+
+                # Format tooltip with timestamp
+                if level_idx > 0 and level.min_readings and level.max_readings:
+                    min_val = getattr(level.min_readings[idx], attr)
+                    max_val = getattr(level.max_readings[idx], attr)
+                    tooltip = f"{ts_str}  {metric}: {val:.3f}{unit}  Min: {min_val:.3f}{unit}  Max: {max_val:.3f}{unit}"
+                else:
+                    tooltip = f"{ts_str}  {metric}: {val:.3f}{unit}"
+
+                dpg.set_value("tooltip_text", tooltip)
+                # Position at bottom-right, inside plot margins
+                tooltip_x = plot_pos[0] + plot_width - 400
+                tooltip_y = plot_pos[1] + plot_height - 105
+                dpg.configure_item("hover_tooltip", pos=[tooltip_x, tooltip_y], show=True)
+                tooltip_shown = True
+                break
+
+        if not tooltip_shown:
+            dpg.configure_item("hover_tooltip", show=False)
 
         # Status bar with all metrics
         status_parts = [
