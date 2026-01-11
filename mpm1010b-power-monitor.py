@@ -99,7 +99,7 @@ class Reading:
 
 @dataclass(frozen=True, slots=True)
 class AggregatedReading:
-    """Aggregated reading with min/max for V, A, W and avg for PF, Hz."""
+    """Aggregated reading with min/max for all metrics."""
     timestamp: float
     voltage_avg: float
     voltage_min: float
@@ -111,10 +111,14 @@ class AggregatedReading:
     power_min: float
     power_max: float
     power_factor_avg: float
+    power_factor_min: float
+    power_factor_max: float
     frequency_avg: float
+    frequency_min: float
+    frequency_max: float
 
-    # Binary format: 52 bytes
-    STRUCT_FORMAT = '<d 3f 3f 3f f f'  # little-endian: 1 double + 11 floats
+    # Binary format: 68 bytes (version 2)
+    STRUCT_FORMAT = '<d 3f 3f 3f 3f 3f'  # little-endian: 1 double + 15 floats
     STRUCT_SIZE = struct.calcsize(STRUCT_FORMAT)
 
     @classmethod
@@ -128,8 +132,8 @@ class AggregatedReading:
             voltage_avg=avg.voltage, voltage_min=min_r.voltage, voltage_max=max_r.voltage,
             current_avg=avg.current, current_min=min_r.current, current_max=max_r.current,
             power_avg=avg.power, power_min=min_r.power, power_max=max_r.power,
-            power_factor_avg=avg.power_factor,
-            frequency_avg=avg.frequency,
+            power_factor_avg=avg.power_factor, power_factor_min=min_r.power_factor, power_factor_max=max_r.power_factor,
+            frequency_avg=avg.frequency, frequency_min=min_r.frequency, frequency_max=max_r.frequency,
         )
 
     @classmethod
@@ -148,7 +152,11 @@ class AggregatedReading:
             power_min=min(a.power_min for a in aggs),
             power_max=max(a.power_max for a in aggs),
             power_factor_avg=sum(a.power_factor_avg for a in aggs) / n,
+            power_factor_min=min(a.power_factor_min for a in aggs),
+            power_factor_max=max(a.power_factor_max for a in aggs),
             frequency_avg=sum(a.frequency_avg for a in aggs) / n,
+            frequency_min=min(a.frequency_min for a in aggs),
+            frequency_max=max(a.frequency_max for a in aggs),
         )
 
     def to_reading(self) -> Reading:
@@ -161,6 +169,26 @@ class AggregatedReading:
             frequency=self.frequency_avg,
         )
 
+    def to_min_reading(self) -> Reading:
+        """Convert to a Reading using min values."""
+        return Reading(
+            voltage=self.voltage_min,
+            current=self.current_min,
+            power=self.power_min,
+            power_factor=self.power_factor_min,
+            frequency=self.frequency_min,
+        )
+
+    def to_max_reading(self) -> Reading:
+        """Convert to a Reading using max values."""
+        return Reading(
+            voltage=self.voltage_max,
+            current=self.current_max,
+            power=self.power_max,
+            power_factor=self.power_factor_max,
+            frequency=self.frequency_max,
+        )
+
     def pack(self) -> bytes:
         """Serialize to binary."""
         return struct.pack(
@@ -169,36 +197,51 @@ class AggregatedReading:
             self.voltage_avg, self.voltage_min, self.voltage_max,
             self.current_avg, self.current_min, self.current_max,
             self.power_avg, self.power_min, self.power_max,
-            self.power_factor_avg, self.frequency_avg,
+            self.power_factor_avg, self.power_factor_min, self.power_factor_max,
+            self.frequency_avg, self.frequency_min, self.frequency_max,
         )
 
     @classmethod
     def unpack(cls, data: bytes) -> Self:
-        """Deserialize from binary."""
+        """Deserialize from binary (v2 format, 68 bytes)."""
         values = struct.unpack(cls.STRUCT_FORMAT, data)
         return cls(
             timestamp=values[0],
             voltage_avg=values[1], voltage_min=values[2], voltage_max=values[3],
             current_avg=values[4], current_min=values[5], current_max=values[6],
             power_avg=values[7], power_min=values[8], power_max=values[9],
-            power_factor_avg=values[10], frequency_avg=values[11],
+            power_factor_avg=values[10], power_factor_min=values[11], power_factor_max=values[12],
+            frequency_avg=values[13], frequency_min=values[14], frequency_max=values[15],
         )
 
 
 @dataclass
 class TimeSeries:
-    """Fixed-size time series buffer with timestamps."""
+    """Fixed-size time series buffer with timestamps and optional min/max."""
     max_samples: int
     timestamps: deque[float] = field(default_factory=deque)
     readings: deque[Reading] = field(default_factory=deque)
+    min_readings: deque[Reading] | None = None
+    max_readings: deque[Reading] | None = None
 
     def __post_init__(self):
         self.timestamps = deque(maxlen=self.max_samples)
         self.readings = deque(maxlen=self.max_samples)
 
-    def append(self, timestamp: float, reading: Reading) -> None:
+    def enable_minmax(self) -> None:
+        """Enable min/max tracking for this time series."""
+        if self.min_readings is None:
+            self.min_readings = deque(maxlen=self.max_samples)
+            self.max_readings = deque(maxlen=self.max_samples)
+
+    def append(self, timestamp: float, reading: Reading,
+               min_reading: Reading | None = None, max_reading: Reading | None = None) -> None:
         self.timestamps.append(timestamp)
         self.readings.append(reading)
+        if self.min_readings is not None and min_reading is not None:
+            self.min_readings.append(min_reading)
+        if self.max_readings is not None and max_reading is not None:
+            self.max_readings.append(max_reading)
 
     def __len__(self) -> int:
         return len(self.timestamps)
@@ -242,7 +285,9 @@ class CascadingBuffer:
 
             if timestamp - self._last_times[i] >= period and self._accumulators[i]:
                 avg = Reading.average(self._accumulators[i])
-                self.levels[i + 1].append(timestamp, avg)
+                min_r = Reading.min(self._accumulators[i])
+                max_r = Reading.max(self._accumulators[i])
+                self.levels[i + 1].append(timestamp, avg, min_r, max_r)
                 self._accumulators[i].clear()
                 self._last_times[i] = timestamp
 
@@ -592,13 +637,28 @@ class DearPyGuiDisplay:
 
                     with dpg.group(tag=f"col_{col}"):
                         for metric in self.metrics:
-                            name, unit, attr, _ = METRICS[metric]
+                            name, unit, attr, color = METRICS[metric]
                             ylabel = unit if unit else metric
 
                             with dpg.plot(label=f"{name} - {time_label}", height=300, tag=f"plot_{metric}_{col}"):
-                                dpg.add_plot_axis(dpg.mvXAxis, label="Time", time=True, tag=f"{metric}_x_{col}")
+                                dpg.add_plot_axis(dpg.mvXAxis, label="Time", scale=dpg.mvPlotScale_Time, tag=f"{metric}_x_{col}")
                                 dpg.add_plot_axis(dpg.mvYAxis, label=ylabel, tag=f"{metric}_y_{col}")
                                 dpg.add_line_series([], [], label=metric, parent=f"{metric}_y_{col}", tag=f"series_{metric}_{col}")
+                                # Add min/max series for aggregated levels (not raw) - use scatter for dotted look
+                                if level_idx > 0:
+                                    dpg.add_scatter_series([], [], label=f"{metric} min", parent=f"{metric}_y_{col}", tag=f"series_{metric}_{col}_min")
+                                    dpg.add_scatter_series([], [], label=f"{metric} max", parent=f"{metric}_y_{col}", tag=f"series_{metric}_{col}_max")
+                                    # Apply themes for min (orange) and max (green) with small translucent markers
+                                    with dpg.theme() as min_theme:
+                                        with dpg.theme_component(dpg.mvScatterSeries):
+                                            dpg.add_theme_color(dpg.mvPlotCol_Line, (255, 165, 0, 128), category=dpg.mvThemeCat_Plots)
+                                            dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 1.0, category=dpg.mvThemeCat_Plots)
+                                    with dpg.theme() as max_theme:
+                                        with dpg.theme_component(dpg.mvScatterSeries):
+                                            dpg.add_theme_color(dpg.mvPlotCol_Line, (0, 255, 0, 128), category=dpg.mvThemeCat_Plots)
+                                            dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 1.0, category=dpg.mvThemeCat_Plots)
+                                    dpg.bind_item_theme(f"series_{metric}_{col}_min", min_theme)
+                                    dpg.bind_item_theme(f"series_{metric}_{col}_max", max_theme)
 
                     if col < n - 1:
                         dpg.add_button(label="", width=SPLITTER_WIDTH, height=300, tag=f"splitter_{col}")
@@ -606,7 +666,13 @@ class DearPyGuiDisplay:
                             dpg.add_item_active_handler(callback=make_splitter_drag(col))
                         dpg.bind_item_handler_registry(f"splitter_{col}", f"splitter_handler_{col}")
 
-            dpg.add_text("", tag="status_text")
+            with dpg.group(horizontal=True):
+                dpg.add_text("", tag="status_text")
+                dpg.add_spacer(width=-1)  # Push checkbox to right
+                dpg.add_checkbox(label="Show", tag="show_minmax", default_value=False)
+                dpg.add_text("Min", color=(255, 165, 0))  # Orange
+                dpg.add_text("/", color=(180, 180, 180))
+                dpg.add_text("Max", color=(0, 255, 0))  # Green
 
         dpg.set_primary_window("main_window", True)
         dpg.set_viewport_resize_callback(resize_plots)
@@ -643,6 +709,20 @@ class DearPyGuiDisplay:
                 values = [getattr(r, attr) for r in level.readings]
 
                 dpg.set_value(f"series_{metric}_{col}", [t, values])
+
+                # Update min/max series for aggregated levels
+                if level_idx > 0 and level.min_readings and level.max_readings:
+                    show_minmax = dpg.get_value("show_minmax")
+                    if show_minmax:
+                        min_values = [getattr(r, attr) for r in level.min_readings]
+                        max_values = [getattr(r, attr) for r in level.max_readings]
+                        dpg.set_value(f"series_{metric}_{col}_min", [t, min_values])
+                        dpg.set_value(f"series_{metric}_{col}_max", [t, max_values])
+                    else:
+                        # Clear min/max series when disabled
+                        dpg.set_value(f"series_{metric}_{col}_min", [[], []])
+                        dpg.set_value(f"series_{metric}_{col}_max", [[], []])
+
                 dpg.fit_axis_data(f"{metric}_x_{col}")
                 dpg.fit_axis_data(f"{metric}_y_{col}")
 
@@ -738,7 +818,7 @@ class BinaryLogger:
     HEADER_FORMAT = '<8s I I d d'
     HEADER_SIZE = 32
     MAGIC = b'MPM1010B'
-    VERSION = 1
+    VERSION = 2
 
     def __post_init__(self):
         self._accumulators = [[] for _ in range(self.num_levels)]
@@ -762,6 +842,9 @@ class BinaryLogger:
                 )
                 if magic != self.MAGIC or file_level != level:
                     raise ValueError(f"Invalid log file: {path}")
+                if version != self.VERSION:
+                    raise ValueError(f"Unsupported file version {version} in {path} (expected {self.VERSION})")
+
                 f.seek(0, 2)  # Seek to end
                 self._start_time = start_time
             else:
@@ -867,10 +950,14 @@ class BinaryLogger:
 
             path = files[0]
             with open(path, 'rb') as f:
-                # Skip header
-                f.seek(cls.HEADER_SIZE)
+                header = f.read(cls.HEADER_SIZE)
+                magic, version, file_level, period, file_start = struct.unpack(
+                    cls.HEADER_FORMAT, header
+                )
+                if version != cls.VERSION:
+                    print(f"# Skipping {path.name}: version {version} != {cls.VERSION}", file=sys.stderr)
+                    continue
 
-                # Read records
                 ts = buffer.levels[level]
                 record_size = AggregatedReading.STRUCT_SIZE
 
@@ -880,15 +967,18 @@ class BinaryLogger:
                 skip_records = max(0, num_records - ts.max_samples)
                 f.seek(cls.HEADER_SIZE + skip_records * record_size)
 
+                count = 0
                 while True:
                     data = f.read(record_size)
                     if len(data) < record_size:
                         break
                     agg = AggregatedReading.unpack(data)
-                    # Use relative timestamp for buffer
                     rel_time = agg.timestamp - start_time
-                    ts.timestamps.append(rel_time)
-                    ts.readings.append(agg.to_reading())
+                    ts.append(rel_time, agg.to_reading(), agg.to_min_reading(), agg.to_max_reading())
+                    count += 1
+
+                if count > 0:
+                    print(f"# Loaded {count} records from {path.name}", file=sys.stderr)
 
         return start_time
 
@@ -991,7 +1081,9 @@ def create_buffer(config: Config) -> CascadingBuffer:
     levels = [TimeSeries(max_samples=int(config.chart_time / config.period))]
     history_samples = int(config.history_time / config.avg_period)
     for _ in range(1, config.num_columns):
-        levels.append(TimeSeries(max_samples=history_samples))
+        ts = TimeSeries(max_samples=history_samples)
+        ts.enable_minmax()
+        levels.append(ts)
     return CascadingBuffer(levels=levels, base_period=config.avg_period)
 
 
@@ -1194,10 +1286,9 @@ def main() -> None:
                 start_time = BinaryLogger.load_history(config.db_path, buffer)
                 if start_time > 0:
                     elapsed = time.time() - start_time
-                    print(f"# Loaded history from {elapsed:.0f}s ago", file=sys.stderr)
+                    print(f"# Resuming session from {elapsed/3600:.1f}h ago", file=sys.stderr)
                     # Set last cascade time so new data integrates smoothly
-                    current_relative = time.time() - start_time
-                    buffer.set_last_time(current_relative)
+                    buffer.set_last_time(time.time() - start_time)
                 else:
                     start_time = None
             binary_logger.open()

@@ -11,7 +11,7 @@ Real-time AC power monitoring for the Matrix MPM-1010B power meter with multi-ti
 ## Features
 
 - **Multi-timescale display**: View data at multiple time resolutions simultaneously (e.g., 25Hz live + 1s avg + 10s avg)
-- **Native GUI**: Hardware-accelerated graphs with draggable column splitters
+- **Native GUI**: Hardware-accelerated graphs with draggable column splitters and min/max overlay
 - **Terminal graphs**: Braille-character plots for SSH/headless use
 - **Text output**: Tab-separated values for piping to other tools
 - **File logging**: TSV output with configurable averaging and optional min/max tracking
@@ -137,9 +137,9 @@ Example: `--metrics V,W,Hz` or `-m all`
 The `--db` option enables persistent history storage. Data is saved in binary format with cascading aggregation levels matching the display columns. On restart, history is automatically reloaded and new data continues from where it left off.
 
 Storage format:
-- 52 bytes per record (timestamp + V/A/W with avg/min/max + PF/Hz avg)
+- 68 bytes per record (timestamp + avg/min/max for all 5 metrics)
 - Separate files per cascade level (`level_0_1s.bin`, `level_1_10s.bin`, etc.)
-- ~1.7 GB/year for all cascade levels with default settings
+- ~2.2 GB/year for all cascade levels with default settings
 
 ### InfluxDB Options
 
