@@ -567,7 +567,7 @@ class DearPyGuiDisplay:
         dpg.create_viewport(title='MPM-1010B Power Monitor', width=1200, height=700)
 
         SPLITTER_WIDTH = 8
-        MAX_COLS = 6  # Max cascade levels
+        MAX_COLS = 7  # Max cascade levels
 
         # Track current column count for detecting changes
         self._last_n_cols = self.num_columns
@@ -611,16 +611,33 @@ class DearPyGuiDisplay:
             """Get list of currently visible metrics."""
             return [m for m in ALL_METRICS if dpg.get_value(f"show_{m}")]
 
-        def get_visible_columns():
-            """Get number of visible columns."""
-            return int(dpg.get_value("column_slider"))
+        def get_column_range():
+            """Get visible column range [start, end] where end is exclusive."""
+            skip_left = dpg.get_value("col_start")
+            total = dpg.get_value("col_end")
+            return skip_left, total
+
+        def on_col_start_change(sender, value):
+            """Ensure start doesn't exceed end - 1 (minimum 1 column visible)."""
+            end = dpg.get_value("col_end")
+            if value > end - 1:
+                dpg.set_value("col_start", end - 1)
+            resize_plots()
+
+        def on_col_end_change(sender, value):
+            """Ensure end doesn't go below start + 1 (minimum 1 column visible)."""
+            start = dpg.get_value("col_start")
+            if value < start + 1:
+                dpg.set_value("col_end", start + 1)
+            resize_plots()
 
         def resize_plots():
             """Resize plots to fit viewport based on visible metrics/columns."""
             visible_metrics = get_visible_metrics()
-            n = get_visible_columns()
+            skip_left, total = get_column_range()
+            n = total - skip_left  # Number of visible columns
 
-            if not visible_metrics:
+            if not visible_metrics or n < 1:
                 return
 
             vp_height = dpg.get_viewport_height()
@@ -631,38 +648,41 @@ class DearPyGuiDisplay:
             item_spacing = 8 * (2 * n - 2)
             usable_width = vp_width - (SPLITTER_WIDTH * num_splitters) - item_spacing - 17
 
-            # Show/hide columns and splitters
+            # Show/hide columns and splitters based on range
             for col in range(MAX_COLS):
-                visible = col < n
+                visible = skip_left <= col < total
                 dpg.configure_item(f"col_{col}", show=visible)
                 if col < MAX_COLS - 1:
-                    dpg.configure_item(f"splitter_{col}", show=visible and col < n - 1)
+                    # Show splitter if both this column and next are visible
+                    splitter_visible = skip_left <= col < total - 1
+                    dpg.configure_item(f"splitter_{col}", show=splitter_visible)
 
             # Show/hide metric plots within visible columns
-            for col in range(n):
+            for col in range(skip_left, total):
                 for metric in ALL_METRICS:
-                    visible = metric in visible_metrics
-                    dpg.configure_item(f"plot_{metric}_{col}", show=visible)
+                    metric_visible = metric in visible_metrics
+                    dpg.configure_item(f"plot_{metric}_{col}", show=metric_visible)
 
             # Get widths for current column count (creates/inherits if needed)
             widths = get_widths_for_n(n)
             self._last_n_cols = n
 
-            # Resize visible columns
+            # Resize visible columns - map visual index to physical column
             total_used = 0
-            for col in range(n):
-                if col == n - 1:
+            for visual_idx, col in enumerate(range(skip_left, total)):
+                if visual_idx == n - 1:
                     w = usable_width - total_used  # Last column gets remainder
                 else:
-                    w = int(usable_width * widths[col])
+                    w = int(usable_width * widths[visual_idx])
                     total_used += w
                 dpg.set_item_width(f"col_{col}", w)
                 for metric in visible_metrics:
                     dpg.set_item_width(f"plot_{metric}_{col}", w)
                     dpg.set_item_height(f"plot_{metric}_{col}", plot_height)
 
-            for i in range(num_splitters):
-                dpg.set_item_height(f"splitter_{i}", content_height)
+            # Resize visible splitters
+            for visual_idx, splitter_col in enumerate(range(skip_left, total - 1)):
+                dpg.set_item_height(f"splitter_{splitter_col}", content_height)
 
         self._resize_plots = resize_plots
 
@@ -671,9 +691,14 @@ class DearPyGuiDisplay:
 
         def make_splitter_drag(idx):
             def on_drag(sender, app_data):
-                n = get_visible_columns()
-                if idx >= n - 1:
+                skip_left, total = get_column_range()
+                n = total - skip_left  # Number of visible columns
+
+                # Convert physical splitter index to visual index
+                visual_idx = idx - skip_left
+                if visual_idx < 0 or visual_idx >= n - 1:
                     return
+
                 mouse_x = dpg.get_mouse_pos(local=False)[0]
                 vp_width = dpg.get_viewport_width()
                 num_splitters = n - 1
@@ -683,20 +708,20 @@ class DearPyGuiDisplay:
                 # Get current widths for this column count
                 widths = get_widths_for_n(n)
 
-                # Calculate cumulative position up to this splitter
-                cumulative = sum(widths[:idx]) * usable_width + 8
-                for i in range(idx):
+                # Calculate cumulative position up to this splitter (using visual indices)
+                cumulative = sum(widths[:visual_idx]) * usable_width + 8
+                for i in range(visual_idx):
                     cumulative += SPLITTER_WIDTH
 
-                # Calculate new width ratio for column idx
+                # Calculate new width ratio for column at visual_idx
                 new_width = max(50, mouse_x - cumulative)
                 new_ratio = new_width / usable_width
 
-                # Apply the change to stored widths
-                delta = new_ratio - widths[idx]
-                if widths[idx + 1] - delta > 0.1:
-                    self._col_widths[n][idx] = new_ratio
-                    self._col_widths[n][idx + 1] = widths[idx + 1] - delta
+                # Apply the change to stored widths (using visual indices)
+                delta = new_ratio - widths[visual_idx]
+                if widths[visual_idx + 1] - delta > 0.1:
+                    self._col_widths[n][visual_idx] = new_ratio
+                    self._col_widths[n][visual_idx + 1] = widths[visual_idx + 1] - delta
                 resize_plots()
             return on_drag
 
@@ -759,9 +784,17 @@ class DearPyGuiDisplay:
                                    callback=on_visibility_change)
 
                 dpg.add_spacer(width=15)
-                dpg.add_slider_int(tag="column_slider", default_value=self.num_columns,
-                                  min_value=2, max_value=6, width=80, format="%d cols",
-                                  callback=on_visibility_change)
+                dpg.add_text("Cols:")
+                # Default: show rightmost columns (realtime + small aggregates)
+                # col 6 = realtime, col 5 = 1s avg, etc.
+                default_start = MAX_COLS - self.num_columns
+                dpg.add_slider_int(tag="col_start", default_value=default_start,
+                                  min_value=0, max_value=6, width=60,
+                                  callback=on_col_start_change)
+                dpg.add_text("-")
+                dpg.add_slider_int(tag="col_end", default_value=MAX_COLS,
+                                  min_value=1, max_value=7, width=60,
+                                  callback=on_col_end_change)
 
                 dpg.add_spacer(width=15)
                 dpg.add_checkbox(label="", tag="show_minmax", default_value=False)
@@ -789,18 +822,22 @@ class DearPyGuiDisplay:
         local_offset = time.timezone if time.daylight == 0 else time.altzone
         tz_adjust = -local_offset  # Convert to seconds ahead of UTC
 
-        # Get current visibility settings
-        n = int(dpg.get_value("column_slider"))
+        MAX_COLS = 7
+
+        # Get current visibility settings from range sliders
+        skip_left = dpg.get_value("col_start")
+        total = dpg.get_value("col_end")
         visible_metrics = [m for m in ALL_METRICS if dpg.get_value(f"show_{m}")]
         show_minmax = dpg.get_value("show_minmax")
 
         # Update plot labels and data for visible columns
-        for col in range(min(n, len(buffer.levels))):
-            level_idx = n - 1 - col
-            if level_idx >= len(buffer.levels):
+        for col in range(skip_left, total):
+            # Level index: rightmost col (6) = level 0 (realtime), col 0 = level 6
+            level_idx = MAX_COLS - 1 - col
+            if level_idx >= len(buffer.levels) or level_idx < 0:
                 continue
 
-            # Update plot labels based on current column count
+            # Update plot labels based on actual level
             if level_idx == 0:
                 hz = 1.0 / self.poll_period
                 time_label = f"{hz:.0f}Hz"
@@ -1187,7 +1224,7 @@ class Config:
 # Main Loop
 # =============================================================================
 
-MAX_CASCADE_LEVELS = 6  # Always create 6 levels for dynamic column switching
+MAX_CASCADE_LEVELS = 7  # Always create 7 levels for dynamic column switching
 
 
 def create_buffer(config: Config) -> CascadingBuffer:
@@ -1295,8 +1332,8 @@ def parse_args() -> Config:
                                help='Terminal graph mode (plotext)')
     display_group.add_argument('--gui', action='store_true',
                                help='Native GUI mode (DearPyGui)')
-    display_group.add_argument('-c', '--columns', type=int, default=3, choices=range(2, 7),
-                               metavar='{2-6}', help='Number of time-scale columns (default: 3)')
+    display_group.add_argument('-c', '--columns', type=int, default=3, choices=range(2, 8),
+                               metavar='{2-7}', help='Number of time-scale columns (default: 3)')
     display_group.add_argument('-t', '--chart-time', type=float, default=60.0,
                                help='Recent window in seconds (default: 60)')
     display_group.add_argument('-T', '--history-time', type=float, default=600.0,

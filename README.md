@@ -74,7 +74,7 @@ usage: mpm1010b-power-monitor.py [-h] [-d DEVICE] [-f] [-p PERIOD] [-l FILE]
 
 | Option | Description |
 |--------|-------------|
-| `-c, --columns {2-6}` | Number of time-scale columns (default: 3) |
+| `-c, --columns {2-7}` | Number of time-scale columns (default: 3) |
 | `-a, --avg-period SEC` | Base averaging period for cascading (default: 1.0) |
 | `-t, --chart-time SEC` | Recent/live window duration (default: 60) |
 | `-T, --history-time SEC` | History window duration (default: 600) |
@@ -88,6 +88,7 @@ The columns display cascading 10x time averages. With default settings (600 samp
 | 4 | 17 hr (100s avg), 1.7 hr (10s avg), 10 min (1s avg), 1 min (25Hz) |
 | 5 | 7 days (1000s avg), 17 hr, 1.7 hr, 10 min, 1 min (25Hz) |
 | 6 | 69 days (10000s avg), 7 days, 17 hr, 1.7 hr, 10 min, 1 min (25Hz) |
+| 7 | 1.9 yr (100000s avg), 69 days, 7 days, 17 hr, 1.7 hr, 10 min, 1 min (25Hz) |
 
 ### Metrics Options
 
