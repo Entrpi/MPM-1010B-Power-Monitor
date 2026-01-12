@@ -1,7 +1,12 @@
-#!/usr/bin/env -S uv run --with pyserial,plotext,dearpygui,influxdb-client python3
+#!/usr/bin/env -S uv run python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pyserial", "plotext", "dearpygui", "influxdb-client"]
+# dependencies = [
+#     "pyserial",
+#     "plotext",
+#     "dearpygui @ git+https://github.com/Entrpi/DearPyGui.git",
+#     "influxdb-client",
+# ]
 # ///
 """
 MPM-1010B AC Power Meter Monitor
@@ -923,36 +928,24 @@ class DearPyGuiDisplay:
                         plot_pos[1] <= mouse_screen[1] <= plot_pos[1] + plot_height):
                     continue
 
-                # Build timestamp list
+                # Build timestamp list (in plot coordinates with tz adjustment)
                 t_list = [self.start_time + ts + tz_adjust for ts in level.timestamps]
                 if not t_list or len(t_list) < 2:
                     continue
 
-                # Use actual data bounds (axis is fitted to these)
                 data_start = t_list[0]
                 data_end = t_list[-1]
                 data_range = data_end - data_start
                 if data_range <= 0:
                     continue
 
-                # Account for plot margins (title on top, axis labels on sides/bottom)
-                left_margin = 63
-                right_margin = 10
-                top_margin = 25
-                bottom_margin = 20
-                plot_area_left = plot_pos[0] + left_margin
-                plot_area_top = plot_pos[1] + top_margin
-                plot_area_width = plot_width - left_margin - right_margin
-                plot_area_height = plot_height - top_margin - bottom_margin
+                # Get mouse position in plot coordinates (requires patched DearPyGui)
+                plot_mouse = dpg.get_plot_mouse_pos(plot=plot_tag)
+                mouse_time = plot_mouse[0]
 
-                # Only show tooltip when mouse is in the actual data area
-                if not (plot_area_left <= mouse_screen[0] <= plot_area_left + plot_area_width and
-                        plot_area_top <= mouse_screen[1] <= plot_area_top + plot_area_height):
+                # Skip if mouse is outside data range
+                if not (data_start <= mouse_time <= data_end):
                     continue
-
-                # Map screen position to time using data bounds
-                norm_x = (mouse_screen[0] - plot_area_left) / plot_area_width
-                mouse_time = data_start + norm_x * data_range
 
                 # Find nearest timestamp in actual data
                 idx = min(range(len(t_list)), key=lambda i: abs(t_list[i] - mouse_time))

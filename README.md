@@ -26,6 +26,10 @@ Real-time AC power monitoring for the Matrix MPM-1010B power meter with multi-ti
 - USB-to-serial adapter (PL2303 or similar)
 - [Matrix MPM-1010B power meter](https://eleshop.eu/matrix-mpm-1010b-power-meter.html)
 
+### Note on DearPyGui
+
+The script uses a [patched DearPyGui](https://github.com/Entrpi/DearPyGui) that fixes `get_plot_mouse_pos()` for accurate hover tooltips ([PR #2596](https://github.com/hoffstadt/DearPyGui/pull/2596)). When using `uv`, this is installed automatically from source on first run (requires a C++ compiler). Once the fix is merged upstream, the script will switch back to PyPI.
+
 ## Quick Start
 
 ```bash
@@ -39,7 +43,7 @@ Real-time AC power monitoring for the Matrix MPM-1010B power meter with multi-ti
 ./mpm1010b-power-monitor.py
 ```
 
-The script uses `uv` for automatic dependency management. Dependencies (pyserial, plotext, dearpygui) are installed on first run.
+The script uses `uv` for automatic dependency management. Dependencies are installed on first run (DearPyGui is built from source, which takes ~1 minute).
 
 ## Usage
 
